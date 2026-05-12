@@ -314,14 +314,8 @@ def make_fused_stages(params, elasticity_cfg, plasticity_cfg, pre_particle_fn, p
             params.inv_dx, params.dx,
             mu_0, lambda_0, theta_c, theta_s, hardening,
         )
-        # G2P still needs weights/indices. Recomputed here in JAX (cheap
-        # B-spline math, no SVD) since the fused kernel discards them.
-        weight, dweight, dpos, index = compute_weights_and_indices(
-            x, params.inv_dx, params.dx, params.num_grids)
-        inter = StepIntermediates(
-            weight=weight, dweight=dweight, dpos=dpos, index=index,
-            x_post_bc=x, F_pre_plast=F_corrected,
-        )
+        # Slim intermediates - G2P recomputes weights from x_post_bc.
+        inter = StepIntermediates(x_post_bc=x, F_pre_plast=F_corrected)
         return grid_mv, grid_m, inter
 
     @jax.jit
@@ -333,10 +327,15 @@ def make_fused_stages(params, elasticity_cfg, plasticity_cfg, pre_particle_fn, p
 
     @jax.jit
     def jit_g2p_no_plast_stage(state, grid_v, inter):
+        # Recompute weights from x_post_bc (the fused kernel already computed
+        # them internally and discarded; recomputing here in JAX costs
+        # ~50 flops/particle and saves ~1100 bytes/particle of HBM).
+        weight, dweight, dpos, index = compute_weights_and_indices(
+            inter.x_post_bc, params.inv_dx, params.dx, params.num_grids)
         # F_pre_plast in the intermediates is the kernel's already-corrected F,
         # so we feed it straight into G2P and don't re-apply plasticity here.
         new_x, new_v, new_C, new_F = g2p_fn(
-            grid_v, inter.weight, inter.dweight, inter.dpos, inter.index,
+            grid_v, weight, dweight, dpos, index,
             inter.F_pre_plast, inter.x_post_bc,
             params.dt, params.inv_dx, params.clip_bound)
         return MPMState(x=new_x, v=new_v, C=new_C, F=new_F)

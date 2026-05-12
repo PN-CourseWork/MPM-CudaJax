@@ -11,13 +11,17 @@ class MPMState(NamedTuple):
 
 
 class StepIntermediates(NamedTuple):
-    """Tensors produced by the P2G stage that the G2P stage needs."""
-    weight: jax.Array   # (N, 27)
-    dweight: jax.Array  # (N, 27, 3)
-    dpos: jax.Array     # (N, 27, 3)
-    index: jax.Array    # (N, 27)
-    x_post_bc: jax.Array  # (N, 3) positions after pre-particle BCs
-    F_pre_plast: jax.Array  # (N, 3, 3) F before plasticity, fed into G2P
+    """Minimal state carried from the P2G stage into the G2P stage.
+
+    Only the post-BC positions and the F that should feed G2P are kept.
+    B-spline weight / dweight / dpos / index tensors are NOT cached here -
+    they would be (N, 27, *) and at large N (a few million particles)
+    materialising them across the JIT boundary blows the GPU memory
+    budget. G2P recomputes them from x_post_bc - the math is cheap
+    (~50 flops/particle, no SVD) and the savings are ~1100 bytes/particle.
+    """
+    x_post_bc: jax.Array     # (N, 3) positions after pre-particle BCs
+    F_pre_plast: jax.Array   # (N, 3, 3) F that G2P should use as its F_p input
 
 class MPMParams(NamedTuple):
     num_grids: int
@@ -360,10 +364,7 @@ def build_jit_stages(params, elasticity_fn, plasticity_fn,
         grid_mv, grid_m = _p2g_fn(
             v, state.C, stress, weight, dweight, dpos, index,
             params.dt, params.vol, params.p_mass, params.num_grids)
-        inter = StepIntermediates(
-            weight=weight, dweight=dweight, dpos=dpos, index=index,
-            x_post_bc=x, F_pre_plast=state.F,
-        )
+        inter = StepIntermediates(x_post_bc=x, F_pre_plast=state.F)
         return grid_mv, grid_m, inter
 
     @jax.jit
@@ -375,8 +376,12 @@ def build_jit_stages(params, elasticity_fn, plasticity_fn,
 
     @jax.jit
     def jit_g2p_stage(state, grid_v, inter):
+        # Recompute weights/indices instead of carrying them across the JIT
+        # boundary - see StepIntermediates docstring.
+        weight, dweight, dpos, index = compute_weights_and_indices(
+            inter.x_post_bc, params.inv_dx, params.dx, params.num_grids)
         new_x, new_v, new_C, new_F = g2p(
-            grid_v, inter.weight, inter.dweight, inter.dpos, inter.index,
+            grid_v, weight, dweight, dpos, index,
             inter.F_pre_plast, inter.x_post_bc,
             params.dt, params.inv_dx, params.clip_bound)
         new_F = plasticity_fn(new_F)
