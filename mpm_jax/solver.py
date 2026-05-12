@@ -9,6 +9,16 @@ class MPMState(NamedTuple):
     C: jax.Array      # (N, 3, 3) APIC affine matrix
     F: jax.Array      # (N, 3, 3) deformation gradient
 
+
+class StepIntermediates(NamedTuple):
+    """Tensors produced by the P2G stage that the G2P stage needs."""
+    weight: jax.Array   # (N, 27)
+    dweight: jax.Array  # (N, 27, 3)
+    dpos: jax.Array     # (N, 27, 3)
+    index: jax.Array    # (N, 27)
+    x_post_bc: jax.Array  # (N, 3) positions after pre-particle BCs
+    F_pre_plast: jax.Array  # (N, 3, 3) F before plasticity, fed into G2P
+
 class MPMParams(NamedTuple):
     num_grids: int
     dt: float
@@ -316,3 +326,60 @@ def simulate_frame(params, state, elasticity_fn, plasticity_fn,
         state = state._replace(F=plasticity_fn(state.F))
         time += params.dt
     return state, time
+
+
+# ---------------------------------------------------------------------------
+# Per-stage JIT path: one JIT per stage, host-side loop drives them.
+# ---------------------------------------------------------------------------
+#
+# Trade-off vs build_jit_frame: extra Python dispatch + 2 sync points per
+# substep, but enables per-stage timing and clean CUDA interop without
+# baking the boundary into the traced graph.
+
+def build_jit_stages(params, elasticity_fn, plasticity_fn,
+                     pre_particle_fn, post_grid_fn, p2g_fn=None):
+    """Build three individually-JIT'd stage functions.
+
+    Returns:
+        (jit_p2g_stage, jit_grid_stage, jit_g2p_stage)
+
+    Signatures (time fixed at 0.0 internally to match build_jit_frame —
+    boundary conditions don't see substep time in the JIT'd path):
+        jit_p2g_stage(state)             -> (grid_mv, grid_m, intermediates)
+        jit_grid_stage(grid_mv, grid_m)  -> grid_v
+        jit_g2p_stage(state, grid_v, intermediates) -> MPMState
+    """
+    _p2g_fn = p2g_fn or p2g
+
+    @jax.jit
+    def jit_p2g_stage(state):
+        x, v = pre_particle_fn(state.x, state.v, 0.0)
+        stress = elasticity_fn(state.F)
+        weight, dweight, dpos, index = compute_weights_and_indices(
+            x, params.inv_dx, params.dx, params.num_grids)
+        grid_mv, grid_m = _p2g_fn(
+            v, state.C, stress, weight, dweight, dpos, index,
+            params.dt, params.vol, params.p_mass, params.num_grids)
+        inter = StepIntermediates(
+            weight=weight, dweight=dweight, dpos=dpos, index=index,
+            x_post_bc=x, F_pre_plast=state.F,
+        )
+        return grid_mv, grid_m, inter
+
+    @jax.jit
+    def jit_grid_stage(grid_mv, grid_m):
+        grid_mv_normalized = grid_update(
+            grid_mv, grid_m, params.gravity, params.dt, params.damping)
+        grid_v = post_grid_fn(grid_mv_normalized, grid_m, 0.0)
+        return grid_v
+
+    @jax.jit
+    def jit_g2p_stage(state, grid_v, inter):
+        new_x, new_v, new_C, new_F = g2p(
+            grid_v, inter.weight, inter.dweight, inter.dpos, inter.index,
+            inter.F_pre_plast, inter.x_post_bc,
+            params.dt, params.inv_dx, params.clip_bound)
+        new_F = plasticity_fn(new_F)
+        return MPMState(x=new_x, v=new_v, C=new_C, F=new_F)
+
+    return jit_p2g_stage, jit_grid_stage, jit_g2p_stage

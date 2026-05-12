@@ -129,7 +129,9 @@ class StageTimer:
 def run_jax(cfg: DictConfig):
     import jax
     import jax.numpy as jnp
-    from mpm_jax.solver import (MPMState, make_params, build_jit_step, build_jit_frame)
+    from mpm_jax.solver import (
+        MPMState, make_params, build_jit_step, build_jit_frame, build_jit_stages,
+    )
     from mpm_jax.constitutive import get_constitutive
     from mpm_jax.boundary import build_boundary_fns
 
@@ -201,11 +203,9 @@ def run_jax(cfg: DictConfig):
     elasticity_fn = get_constitutive(mat.elasticity)
     plasticity_fn = get_constitutive(mat.plasticity)
 
-    # Build JIT-compiled step and frame functions
-    jit_step = build_jit_step(params, elasticity_fn, plasticity_fn,
-                               pre_fn, post_fn, p2g_fn=p2g_fn)
-    jit_frame = build_jit_frame(params, elasticity_fn, plasticity_fn,
-                                 pre_fn, post_fn, sim.steps_per_frame, p2g_fn=p2g_fn)
+    timing_mode = cfg.get('timing_mode', 'per_frame')
+    assert timing_mode in ('per_frame', 'per_stage'), \
+        f"timing_mode must be 'per_frame' or 'per_stage', got {timing_mode!r}"
 
     def make_state():
         return MPMState(
@@ -215,23 +215,73 @@ def run_jax(cfg: DictConfig):
             F=jnp.tile(jnp.eye(3), (n, 1, 1)),
         )
 
-    # Warmup JIT compilation
+    if timing_mode == 'per_frame':
+        # ---- monolithic JIT'd frame ----
+        jit_step = build_jit_step(params, elasticity_fn, plasticity_fn,
+                                  pre_fn, post_fn, p2g_fn=p2g_fn)
+        jit_frame = build_jit_frame(params, elasticity_fn, plasticity_fn,
+                                    pre_fn, post_fn, sim.steps_per_frame, p2g_fn=p2g_fn)
+
+        # Warmup
+        state = make_state()
+        state = jit_step(state)
+        jax.block_until_ready(state.x)
+        state = make_state()
+        state = jit_frame(state)
+        jax.block_until_ready(state.x)
+
+        state = make_state()
+        timer = StageTimer()
+        frames = []
+        frame_metrics = []
+        frame_timings = []
+
+        cuda_profiler_start()
+        t0 = time.perf_counter()
+
+        for frame in tqdm(range(sim.num_frames), desc='JAX'):
+            if not bench:
+                frames.append(np.array(state.x))
+
+            timer.start('timestep')
+            state = jit_frame(state)
+            jax.block_until_ready(state.x)
+            timer.stop()
+
+            ft = timer.flush_frame()
+            frame_ms = sum(ft.values())
+            frame_timings.append(ft)
+            frame_metrics.append({
+                'x_mean_z': float(state.x[:, 2].mean()),
+                'v_max': float(jnp.abs(state.v).max()),
+                'frame_ms': frame_ms,
+                **{f'{k}_ms': v for k, v in ft.items()},
+            })
+
+        elapsed = time.perf_counter() - t0
+        cuda_profiler_stop()
+        total_steps = sim.num_frames * sim.steps_per_frame
+        return frames, elapsed, total_steps, timer.summary_from_frames(frame_timings), frame_metrics
+
+    # ---- per-stage path: Python loop over substeps, sync between stages ----
+    jit_p2g_stage, jit_grid_stage, jit_g2p_stage = build_jit_stages(
+        params, elasticity_fn, plasticity_fn, pre_fn, post_fn, p2g_fn=p2g_fn)
+
+    # Warmup each stage
     state = make_state()
-    state = jit_step(state)
-    jax.block_until_ready(state.x)
-    state = make_state()
-    state = jit_frame(state)
+    grid_mv, grid_m, inter = jit_p2g_stage(state)
+    jax.block_until_ready(grid_mv)
+    grid_v = jit_grid_stage(grid_mv, grid_m)
+    jax.block_until_ready(grid_v)
+    state = jit_g2p_stage(state, grid_v, inter)
     jax.block_until_ready(state.x)
 
-    # Reset and time
     state = make_state()
     timer = StageTimer()
     frames = []
     frame_metrics = []
     frame_timings = []
 
-    # Always bracket the hot loop with profiler markers.
-    # No-ops if not running under nsys.
     cuda_profiler_start()
     t0 = time.perf_counter()
 
@@ -239,10 +289,21 @@ def run_jax(cfg: DictConfig):
         if not bench:
             frames.append(np.array(state.x))
 
-        timer.start('timestep')
-        state = jit_frame(state)
-        jax.block_until_ready(state.x)
-        timer.stop()
+        for _ in range(sim.steps_per_frame):
+            timer.start('p2g')
+            grid_mv, grid_m, inter = jit_p2g_stage(state)
+            jax.block_until_ready(grid_mv)
+            timer.stop()
+
+            timer.start('grid_update')
+            grid_v = jit_grid_stage(grid_mv, grid_m)
+            jax.block_until_ready(grid_v)
+            timer.stop()
+
+            timer.start('g2p')
+            state = jit_g2p_stage(state, grid_v, inter)
+            jax.block_until_ready(state.x)
+            timer.stop()
 
         ft = timer.flush_frame()
         frame_ms = sum(ft.values())
@@ -255,7 +316,6 @@ def run_jax(cfg: DictConfig):
         })
 
     elapsed = time.perf_counter() - t0
-
     cuda_profiler_stop()
     total_steps = sim.num_frames * sim.steps_per_frame
     return frames, elapsed, total_steps, timer.summary_from_frames(frame_timings), frame_metrics

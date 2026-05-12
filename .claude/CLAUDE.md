@@ -125,6 +125,8 @@ CMake auto-detects the local GPU arch when `MPM_CUDA_ARCH` is unset. `make setup
 
 ## Conventions
 
+- **Sweeps must use Hydra multirun**, never a bash `for` loop. Either use a pre-baked sweep config (`-cn sweep_*`) or pass the axes inline with `-m / --multirun`, e.g. `uv run --extra jax-cuda python simulate.py -m sim.n_particles=5000,50000,200000 kernel=jax,cuda_v1,cuda_v3 timing_mode=per_frame,per_stage benchmark=true`. For repeated experiments, add a new `conf/sweep_<name>.yaml` rather than encoding the grid in shell. Hydra puts each combination in its own `multirun/<date>/<run>/` subdir, which is what wandb / log parsers expect.
+- **Default to short benchmarks.** Steady-state ms/step is locked in after the first frame (the warmup), so `sim.num_frames=5` (= 50 substeps) gives stable timings — don't burn 10× the wall time on `num_frames=30` unless you specifically need tight per-frame std. Bump it only when an individual measurement looks noisy.
 - Single-particle functions live in `mpm_jax/solver.py`; vectorise via `jax.vmap`. Don't write batched code by hand — vmap is the contract.
 - A new CUDA scatter kernel = a new `.cu` file in `mpm_jax/cuda/kernels/`, a `_register_*` + `cuda_p2g_scatter_*` wrapper in `p2g_cuda.py`, a `kernel=cuda_vX` branch in `simulate.run_jax`, a matching `conf/kernel/cuda_vX.yaml`, **and add the kernel name to the `KERNELS` list in `CMakeLists.txt`**. After editing, `make cuda` (or any `uv sync --reinstall-package mpm-cudajax`) rebuilds.
 - Boundary conditions and constitutive models are registry-based (`REGISTRY` dict in `constitutive.py`, `build_boundary_fns` in `boundary.py`); add a function and a config entry.

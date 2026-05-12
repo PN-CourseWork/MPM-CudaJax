@@ -12,6 +12,8 @@ from .solver import (  # noqa: F401
     g2p as g2p,
     build_jit_step as build_jit_step,
     build_jit_frame as build_jit_frame,
+    build_jit_stages as build_jit_stages,
+    StepIntermediates as StepIntermediates,
 )
 from .constitutive import get_constitutive as get_constitutive, ELASTICITY as ELASTICITY, PLASTICITY as PLASTICITY  # noqa: F401
 from .boundary import build_boundary_fns as build_boundary_fns  # noqa: F401

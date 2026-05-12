@@ -8,3 +8,8 @@ defaults:
 output_dir: ./output
 tag: jelly
 benchmark: false  # skip GIF rendering and frame saving when true
+# per_frame: monolithic lax.scan JIT (one XLA program for the whole frame).
+# per_stage: Python loop with p2g/grid_update/g2p individually JIT'd; enables
+#            per-stage timing and clean CUDA interop at the cost of dispatch
+#            + sync overhead.
+timing_mode: per_frame
