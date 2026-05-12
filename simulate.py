@@ -278,7 +278,12 @@ def run_jax(cfg: DictConfig):
         total_steps = sim.num_frames * sim.steps_per_frame
         return frames, elapsed, total_steps, timer.summary_from_frames(frame_timings), frame_metrics
 
-    # ---- per-stage path: Python loop over substeps, sync between stages ----
+    # ---- per-stage path: Python loop over substeps, NO sync between stages ----
+    # Wall-clock timing only. The intra-substep stage syncs that used to live
+    # here gave a per-stage breakdown but added ~30 block_until_ready calls per
+    # frame and serialised the GPU stream artificially. One sync per frame is
+    # enough to make perf_counter() meaningful; use nsys/ncu when you actually
+    # need a per-stage breakdown.
     if kernel_name == 'cuda_v2':
         from mpm_jax.cuda.p2g_cuda import make_fused_stages
         jit_p2g_stage, jit_grid_stage, jit_g2p_stage = make_fused_stages(
@@ -287,9 +292,7 @@ def run_jax(cfg: DictConfig):
         jit_p2g_stage, jit_grid_stage, jit_g2p_stage = build_jit_stages(
             params, elasticity_fn, plasticity_fn, pre_fn, post_fn, p2g_fn=p2g_fn)
 
-    # Warmup: run one full substep through all three stages, then compile
-    # the metric reads. After this every JIT trace+compile is done, so the
-    # first frame of the timed loop is already in steady state.
+    # Warmup: one full substep through all stages, then the metric reads.
     state = make_state()
     grid_mv, grid_m, inter = jit_p2g_stage(state)
     grid_v = jit_grid_stage(grid_mv, grid_m)
@@ -310,21 +313,13 @@ def run_jax(cfg: DictConfig):
         if not bench:
             frames.append(np.array(state.x))
 
+        timer.start('timestep')
         for _ in range(sim.steps_per_frame):
-            timer.start('p2g')
             grid_mv, grid_m, inter = jit_p2g_stage(state)
-            jax.block_until_ready(grid_mv)
-            timer.stop()
-
-            timer.start('grid_update')
             grid_v = jit_grid_stage(grid_mv, grid_m)
-            jax.block_until_ready(grid_v)
-            timer.stop()
-
-            timer.start('g2p')
             state = jit_g2p_stage(state, grid_v, inter)
-            jax.block_until_ready(state.x)
-            timer.stop()
+        jax.block_until_ready(state.x)
+        timer.stop()
 
         ft = timer.flush_frame()
         frame_ms = sum(ft.values())
