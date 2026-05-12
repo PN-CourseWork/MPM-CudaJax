@@ -18,13 +18,15 @@ LOAD_MODULES := source /etc/profile.d/modules.sh 2>/dev/null; \
 
 .PHONY: setup cuda test sweep sweep-quick sweep-all clean
 
-setup: cuda
+setup:
+	@$(LOAD_MODULES); \
 	uv sync --extra jax-cuda
 
+# Force a CUDA kernel rebuild by reinstalling the project (scikit-build-core
+# also auto-rebuilds on .cu changes when imported, via editable.rebuild=true).
 cuda:
 	@$(LOAD_MODULES); \
-	cd mpm_jax/cuda/kernels && \
-	uv run --extra jax-cuda make
+	uv sync --extra jax-cuda --reinstall-package mpm-cudajax
 
 test:
 	uv run --extra jax --with pytest python -m pytest tests/ -v

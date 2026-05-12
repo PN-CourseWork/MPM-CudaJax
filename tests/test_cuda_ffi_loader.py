@@ -1,47 +1,33 @@
 from pathlib import Path
-from types import SimpleNamespace
 
 from mpm_jax.cuda import p2g_cuda
 
 
-def test_compile_kernel_writes_shared_library_to_cache(monkeypatch, tmp_path):
-    cache_dir = tmp_path / "ffi-cache"
-    captured = {}
+def test_register_missing_so_returns_false(monkeypatch, tmp_path):
+    """When the prebuilt .so is absent we should fail gracefully (False, no raise)."""
+    monkeypatch.setattr(p2g_cuda, "_LIB_DIR", tmp_path)
+    p2g_cuda._REGISTERED.clear()
 
-    monkeypatch.setenv("MPM_FFI_CACHE", str(cache_dir))
-    monkeypatch.setenv("NVCC", "/opt/cuda/bin/nvcc")
-    monkeypatch.setattr(p2g_cuda.jax.ffi, "include_dir", lambda: "/jax/ffi/include")
-
-    def fake_run(cmd, capture_output=False, text=False):
-        if cmd == ["gcc", "-print-file-name=libstdc++.so"]:
-            return SimpleNamespace(
-                returncode=0,
-                stdout="/usr/lib/gcc/libstdc++.so\n",
-                stderr="",
-            )
-        captured["cmd"] = cmd
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(p2g_cuda.subprocess, "run", fake_run)
-
-    assert p2g_cuda._compile_kernel("p2g_scatter.cu", "libp2g_scatter.so")
-
-    cmd = captured["cmd"]
-    output_path = Path(cmd[cmd.index("-o") + 1])
-    assert output_path == cache_dir / "libp2g_scatter.so"
-    assert Path(cmd[-1]) == Path(p2g_cuda._KERNEL_DIR) / "p2g_scatter.cu"
+    assert (
+        p2g_cuda._register(
+            "unit_test_missing", "libdoes_not_exist.so", "MissingSymbol"
+        )
+        is False
+    )
 
 
-def test_register_uses_cached_library_and_explicit_ffi_api(monkeypatch, tmp_path):
-    cache_dir = tmp_path / "ffi-cache"
-    calls = {}
-    loaded = {}
+def test_register_loads_prebuilt_so_and_calls_ffi(monkeypatch, tmp_path):
+    """Happy path: .so exists in _LIB_DIR, gets loaded, FFI target registered."""
+    so_path = tmp_path / "libp2g_scatter.so"
+    so_path.write_bytes(b"")  # only existence matters; LoadLibrary is faked
+    monkeypatch.setattr(p2g_cuda, "_LIB_DIR", tmp_path)
 
     class FakeLibrary:
         P2GScatter = object()
 
-    monkeypatch.setenv("MPM_FFI_CACHE", str(cache_dir))
-    monkeypatch.setattr(p2g_cuda, "_compile_kernel", lambda cu_name, so_name: True)
+    loaded = {}
+    calls = {}
+
     def fake_load_library(path):
         loaded["path"] = path
         return FakeLibrary()
@@ -60,13 +46,37 @@ def test_register_uses_cached_library_and_explicit_ffi_api(monkeypatch, tmp_path
     p2g_cuda._REGISTERED.clear()
 
     assert p2g_cuda._register(
-        "unit_test_p2g_scatter_cuda",
-        "p2g_scatter.cu",
-        "libp2g_scatter.so",
-        "P2GScatter",
+        "unit_test_p2g_scatter_cuda", "libp2g_scatter.so", "P2GScatter"
     )
 
-    assert Path(loaded["path"]) == cache_dir / "libp2g_scatter.so"
+    assert Path(loaded["path"]) == so_path
     assert calls["name"] == "unit_test_p2g_scatter_cuda"
+    assert calls["capsule"] is FakeLibrary.P2GScatter
     assert calls["platform"] == "CUDA"
     assert calls["api_version"] == 1
+
+
+def test_register_is_cached(monkeypatch, tmp_path):
+    """Second _register() call for the same name should not re-load the library."""
+    so_path = tmp_path / "libp2g_scatter.so"
+    so_path.write_bytes(b"")
+    monkeypatch.setattr(p2g_cuda, "_LIB_DIR", tmp_path)
+
+    calls = []
+
+    class FakeLibrary:
+        P2GScatter = object()
+
+    monkeypatch.setattr(
+        p2g_cuda.ctypes.cdll,
+        "LoadLibrary",
+        lambda path: (calls.append(path), FakeLibrary())[1],
+    )
+    monkeypatch.setattr(p2g_cuda.jax.ffi, "pycapsule", lambda s: s)
+    monkeypatch.setattr(p2g_cuda.jax.ffi, "register_ffi_target", lambda *a, **k: None)
+    p2g_cuda._REGISTERED.clear()
+
+    name = "unit_test_cache_check"
+    assert p2g_cuda._register(name, "libp2g_scatter.so", "P2GScatter")
+    assert p2g_cuda._register(name, "libp2g_scatter.so", "P2GScatter")
+    assert len(calls) == 1

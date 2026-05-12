@@ -5,6 +5,7 @@ dist/
 build/
 .venv/
 *.egg
+mpm_jax/cuda/_lib/
 output/
 outputs/
 uv.lock

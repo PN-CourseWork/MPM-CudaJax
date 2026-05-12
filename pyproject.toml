@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core>=0.10", "cmake>=3.24", "jax>=0.4.20"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "mpm-cudajax"
@@ -20,8 +20,15 @@ dependencies = [
 jax = ["jax>=0.4.20", "jaxlib>=0.4.20"]
 jax-cuda = ["jax[cuda12]>=0.4.20"]
 
-[tool.setuptools.packages.find]
-include = ["mpm_jax*"]
+[tool.scikit-build]
+# Auto-rebuild the .so files on import when .cu sources change in editable mode.
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["mpm_jax"]
+editable.rebuild = true
+editable.verbose = false
+# CUDA build is best-effort: when nvcc is missing CMake `return()`s and the
+# wheel installs cleanly without kernels.
+cmake.build-type = "Release"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

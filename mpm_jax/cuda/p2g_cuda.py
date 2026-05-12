@@ -1,15 +1,16 @@
 """CUDA P2G kernels, integrated via JAX FFI.
 
-Kernels are compiled automatically from .cu source on first use (requires
-nvcc on PATH). The compiled .so is cached in build/ffi by default, or in
-MPM_FFI_CACHE when that environment variable is set.
+The .so files are built at install time by scikit-build-core + CMake (see
+CMakeLists.txt) and shipped inside ``mpm_jax/cuda/_lib/``. Run
+``uv sync --extra jax-cuda`` to (re)build; with ``editable.rebuild=true`` in
+pyproject.toml, edits to the .cu sources also trigger a rebuild on import.
+
+Override the CUDA architecture at build time with ``MPM_CUDA_ARCH=sm_86``
+(default: ``native``).
 """
 
-import os
-import subprocess
 import ctypes
 import logging
-import shutil
 from pathlib import Path
 from threading import Lock
 
@@ -20,111 +21,31 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
-_PROJECT_ROOT = _PACKAGE_DIR.parents[1]
-_KERNEL_DIR = _PACKAGE_DIR / "kernels"
-_FFI_CACHE_ENV = "MPM_FFI_CACHE"
-_REGISTERED = {}
+_LIB_DIR = _PACKAGE_DIR / "_lib"
+_REGISTERED: dict[str, bool] = {}
 _REGISTER_LOCK = Lock()
 
 
-def _ffi_cache_dir() -> Path:
-    cache_root = os.environ.get(_FFI_CACHE_ENV)
-    if cache_root:
-        path = Path(cache_root).expanduser()
-    else:
-        path = _PROJECT_ROOT / "build" / "ffi"
-    path.mkdir(parents=True, exist_ok=True)
-    return path.resolve()
+def _shared_library_path(so_name: str) -> Path:
+    return _LIB_DIR / so_name
 
 
-def _kernel_source_path(cu_name) -> Path:
-    return _KERNEL_DIR / cu_name
-
-
-def _shared_library_path(so_name) -> Path:
-    return _ffi_cache_dir() / so_name
-
-
-def _compile_kernel(cu_name, so_name):
-    """Compile a .cu file to .so using nvcc. Returns True on success."""
-    cu_path = _kernel_source_path(cu_name)
-    so_path = _shared_library_path(so_name)
-
-    # Skip if .so exists and is newer than .cu
-    if so_path.exists():
-        if so_path.stat().st_mtime > cu_path.stat().st_mtime:
-            return True
-
-    if not cu_path.exists():
-        logger.error("CUDA source not found: %s", cu_path)
-        return False
-
-    # Prefer an nvcc matching the driver's CUDA version to avoid
-    # "driver version insufficient" errors. Fall back to PATH nvcc.
-    nvcc = os.environ.get("NVCC", shutil.which("nvcc"))
-    if not nvcc:
-        logger.warning("nvcc not found on PATH — cannot compile CUDA kernels. "
-                       "Set NVCC env var to point to a compatible nvcc.")
-        return False
-
-    # Get FFI include dir
-    try:
-        ffi_inc = jax.ffi.include_dir()
-    except Exception:
-        logger.warning("Cannot determine JAX FFI include dir")
-        return False
-
-    # Find the GCC libstdc++ and set RPATH so the .so can find it at runtime
-    gcc_lib_dir = None
-    try:
-        gcc_lib = subprocess.run(
-            ["gcc", "-print-file-name=libstdc++.so"],
-            capture_output=True, text=True
-        )
-        if gcc_lib.returncode == 0 and "/" in gcc_lib.stdout.strip():
-            gcc_lib_dir = os.path.dirname(os.path.realpath(gcc_lib.stdout.strip()))
-            logger.info("Using GCC libstdc++ from %s", gcc_lib_dir)
-    except FileNotFoundError:
-        pass
-
-    cmd = [
-        nvcc,
-        "-arch=sm_90",
-        "-O3",
-        "--use_fast_math",
-        "-std=c++17",
-        "-Xcompiler", "-fPIC",
-        "-shared",
-        f"-I{ffi_inc}",
-        "-diag-suppress=940,2473",
-        "-Xcompiler", "-Wno-return-type",
-    ]
-    if gcc_lib_dir:
-        cmd.extend(["-Xlinker", "-rpath", "-Xlinker", gcc_lib_dir])
-    cmd.extend(["-o", str(so_path), str(cu_path)])
-
-    logger.info("Compiling %s -> %s", cu_name, so_name)
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        logger.error("nvcc failed:\n%s\n%s", result.stdout, result.stderr)
-        return False
-
-    logger.info("Compiled %s successfully", so_name)
-    return True
-
-
-def _register(name, cu_name, so_name, symbol):
-    """Compile if needed, load .so, and register FFI target."""
+def _register(name: str, so_name: str, symbol: str) -> bool:
+    """Load .so from the package's _lib/ dir and register the FFI target."""
     with _REGISTER_LOCK:
         if name in _REGISTERED:
             return _REGISTERED[name]
 
-        # Auto-compile
-        if not _compile_kernel(cu_name, so_name):
+        so_path = _shared_library_path(so_name)
+        if not so_path.exists():
+            logger.warning(
+                "CUDA kernel %s not built. Run `uv sync --extra jax-cuda` "
+                "in an environment where nvcc is on PATH.",
+                so_name,
+            )
             _REGISTERED[name] = False
             return False
 
-        so_path = _shared_library_path(so_name)
         try:
             lib = ctypes.cdll.LoadLibrary(str(so_path))
             jax.ffi.register_ffi_target(
@@ -134,7 +55,7 @@ def _register(name, cu_name, so_name, symbol):
                 api_version=1,
             )
             _REGISTERED[name] = True
-            logger.info("Registered CUDA kernel '%s'", name)
+            logger.info("Registered CUDA kernel '%s' from %s", name, so_path)
             return True
         except Exception as e:
             logger.error("Failed to register CUDA kernel '%s': %s", name, e)
@@ -143,19 +64,19 @@ def _register(name, cu_name, so_name, symbol):
 
 
 def _register_scatter():
-    return _register("p2g_scatter_cuda", "p2g_scatter.cu", "libp2g_scatter.so", "P2GScatter")
+    return _register("p2g_scatter_cuda", "libp2g_scatter.so", "P2GScatter")
 
 
 def _register_warp():
-    return _register("p2g_scatter_warp_cuda", "p2g_scatter_warp.cu", "libp2g_scatter_warp.so", "P2GScatterWarp")
+    return _register("p2g_scatter_warp_cuda", "libp2g_scatter_warp.so", "P2GScatterWarp")
 
 
 def _register_smem():
-    return _register("p2g_scatter_smem_cuda", "p2g_scatter_smem.cu", "libp2g_scatter_smem.so", "P2GScatterSmem")
+    return _register("p2g_scatter_smem_cuda", "libp2g_scatter_smem.so", "P2GScatterSmem")
 
 
 def _register_fused():
-    return _register("p2g_fused_cuda", "p2g_fused.cu", "libp2g_fused.so", "P2GFused")
+    return _register("p2g_fused_cuda", "libp2g_fused.so", "P2GFused")
 
 
 def cuda_p2g_scatter(mv, m, index, num_grids):
@@ -179,11 +100,7 @@ def cuda_p2g_scatter(mv, m, index, num_grids):
 
 
 def cuda_p2g_scatter_warp(mv, m, index, num_grids):
-    """CUDA P2G scatter with warp-level reduction via JAX FFI.
-
-    Same interface as cuda_p2g_scatter but uses __match_any_sync +
-    __shfl_down_sync to reduce atomics within each warp.
-    """
+    """CUDA P2G scatter with warp-level reduction via JAX FFI."""
     G3 = num_grids ** 3
     index = index.astype(jnp.int32)
 
@@ -200,27 +117,20 @@ def cuda_p2g_scatter_warp(mv, m, index, num_grids):
 
 
 def cuda_p2g_scatter_smem(mv, m, index, num_grids):
-    """CUDA P2G scatter with shared memory staging via JAX FFI.
-
-    Sorts particles by cell, then uses per-cell shared memory tiles
-    (4x4x4) to accumulate contributions before flushing to global memory.
-    This reduces global atomics from 4*27*N to ~4*64*num_occupied_cells.
-    """
+    """CUDA P2G scatter with shared-memory tile staging via JAX FFI."""
     G = num_grids
     G3 = G ** 3
 
     index_i32 = index.astype(jnp.int32)
 
     # Sort particles by their home cell (center stencil node = offset 13)
-    cell_id = index_i32[:, 13]  # (N,) — particle's cell
+    cell_id = index_i32[:, 13]
     order = jnp.argsort(cell_id)
 
-    mv_sorted = mv[order]        # (N, 27, 3)
-    m_sorted = m[order]           # (N, 27)
-    index_sorted = index_i32[order]  # (N, 27)
+    mv_sorted = mv[order]
+    m_sorted = m[order]
+    index_sorted = index_i32[order]
 
-    # Build cell_start: CSR-style, cell_start[c] = first particle in cell c
-    # Using searchsorted on the sorted cell IDs
     cell_id_sorted = cell_id[order]
     cell_boundaries = jnp.arange(G3 + 1, dtype=jnp.int32)
     cell_start = jnp.searchsorted(cell_id_sorted, cell_boundaries).astype(jnp.int32)
@@ -277,7 +187,7 @@ def cuda_p2g_fused(x, v, C, F, num_grids, dt, vol, p_mass, inv_dx, dx,
 
 
 def is_available(kernel='scatter'):
-    """Check if a CUDA kernel can be compiled and registered."""
+    """Check if a prebuilt CUDA kernel can be loaded and registered."""
     if kernel == 'scatter':
         return _register_scatter()
     elif kernel == 'warp':
@@ -292,8 +202,8 @@ def is_available(kernel='scatter'):
 def make_cuda_p2g(num_grids, kernel='scatter'):
     """Create a CUDA-accelerated p2g function matching the solver interface.
 
-    Compiles the kernel automatically if needed.
-    Returns None if nvcc is not available.
+    Returns None if the prebuilt kernel is not available (.so missing or
+    failed to register).
     """
     if kernel == 'scatter':
         if not is_available('scatter'):
@@ -334,7 +244,7 @@ def make_cuda_p2g(num_grids, kernel='scatter'):
     elif kernel == 'fused':
         if not is_available('fused'):
             return None
-        logger.info("Fused CUDA P2G registered — use cuda_p2g_fused() directly")
+        logger.info("Fused CUDA P2G registered - use cuda_p2g_fused() directly")
         return None  # handled specially in the driver
 
     return None
