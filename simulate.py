@@ -223,6 +223,12 @@ def run_jax(cfg: DictConfig):
             "Run with timing_mode=per_stage."
         )
 
+    def _warmup_metrics(s):
+        """Compile the per-frame metric reads so the first timed frame doesn't
+        eat a one-shot trace+compile on jnp.mean / jnp.abs.max."""
+        _ = float(s.x[:, 2].mean())
+        _ = float(jnp.abs(s.v).max())
+
     if timing_mode == 'per_frame':
         # ---- monolithic JIT'd frame ----
         jit_step = build_jit_step(params, elasticity_fn, plasticity_fn,
@@ -230,13 +236,14 @@ def run_jax(cfg: DictConfig):
         jit_frame = build_jit_frame(params, elasticity_fn, plasticity_fn,
                                     pre_fn, post_fn, sim.steps_per_frame, p2g_fn=p2g_fn)
 
-        # Warmup
+        # Warmup: compile jit_step, jit_frame, and the metric reads.
         state = make_state()
         state = jit_step(state)
         jax.block_until_ready(state.x)
         state = make_state()
         state = jit_frame(state)
         jax.block_until_ready(state.x)
+        _warmup_metrics(state)
 
         state = make_state()
         timer = StageTimer()
@@ -280,14 +287,15 @@ def run_jax(cfg: DictConfig):
         jit_p2g_stage, jit_grid_stage, jit_g2p_stage = build_jit_stages(
             params, elasticity_fn, plasticity_fn, pre_fn, post_fn, p2g_fn=p2g_fn)
 
-    # Warmup each stage
+    # Warmup: run one full substep through all three stages, then compile
+    # the metric reads. After this every JIT trace+compile is done, so the
+    # first frame of the timed loop is already in steady state.
     state = make_state()
     grid_mv, grid_m, inter = jit_p2g_stage(state)
-    jax.block_until_ready(grid_mv)
     grid_v = jit_grid_stage(grid_mv, grid_m)
-    jax.block_until_ready(grid_v)
     state = jit_g2p_stage(state, grid_v, inter)
     jax.block_until_ready(state.x)
+    _warmup_metrics(state)
 
     state = make_state()
     timer = StageTimer()
