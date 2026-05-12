@@ -229,112 +229,94 @@ def run_jax(cfg: DictConfig):
         _ = float(s.x[:, 2].mean())
         _ = float(jnp.abs(s.v).max())
 
+    # ---- Build the substep function for whichever timing_mode is selected ----
     if timing_mode == 'per_frame':
-        # ---- monolithic JIT'd frame ----
         jit_step = build_jit_step(params, elasticity_fn, plasticity_fn,
                                   pre_fn, post_fn, p2g_fn=p2g_fn)
         jit_frame = build_jit_frame(params, elasticity_fn, plasticity_fn,
                                     pre_fn, post_fn, sim.steps_per_frame, p2g_fn=p2g_fn)
 
-        # Warmup: compile jit_step, jit_frame, and the metric reads.
+        def run_frame(s):
+            return jit_frame(s)
+
+        # Warmup: trace+compile everything we'll use in the timed region.
         state = make_state()
-        state = jit_step(state)
-        jax.block_until_ready(state.x)
+        state = jit_step(state); jax.block_until_ready(state.x)
         state = make_state()
-        state = jit_frame(state)
+        state = jit_frame(state); jax.block_until_ready(state.x)
+        _warmup_metrics(state)
+    else:  # per_stage
+        if kernel_name == 'cuda_v2':
+            from mpm_jax.cuda.p2g_cuda import make_fused_stages
+            jit_p2g_stage, jit_grid_stage, jit_g2p_stage = make_fused_stages(
+                params, mat.elasticity, mat.plasticity, pre_fn, post_fn)
+        else:
+            jit_p2g_stage, jit_grid_stage, jit_g2p_stage = build_jit_stages(
+                params, elasticity_fn, plasticity_fn, pre_fn, post_fn, p2g_fn=p2g_fn)
+
+        def run_frame(s):
+            for _ in range(sim.steps_per_frame):
+                grid_mv, grid_m, inter = jit_p2g_stage(s)
+                grid_v = jit_grid_stage(grid_mv, grid_m)
+                s = jit_g2p_stage(s, grid_v, inter)
+            return s
+
+        state = make_state()
+        grid_mv, grid_m, inter = jit_p2g_stage(state)
+        grid_v = jit_grid_stage(grid_mv, grid_m)
+        state = jit_g2p_stage(state, grid_v, inter)
         jax.block_until_ready(state.x)
         _warmup_metrics(state)
 
-        state = make_state()
-        timer = StageTimer()
-        frames = []
-        frame_metrics = []
-        frame_timings = []
+    # ---- Timed region ----
+    # Benchmark mode: dispatch every frame back-to-back with no intra-loop
+    # sync. JAX queues the work on its stream; we block once at the end and
+    # divide elapsed by num_frames for the average. This gives the GPU the
+    # most freedom to pipeline launches.
+    #
+    # Non-benchmark mode (GIF rendering): we have to materialise state.x
+    # to host every frame to capture the trajectory, which forces a sync
+    # per frame anyway. Keep the per-frame metrics in that path.
+    state = make_state()
+    frames = []
+    frame_metrics = []
 
-        cuda_profiler_start()
+    cuda_profiler_start()
+
+    if bench:
         t0 = time.perf_counter()
-
-        for frame in tqdm(range(sim.num_frames), desc='JAX'):
-            if not bench:
-                frames.append(np.array(state.x))
-
-            timer.start('timestep')
-            state = jit_frame(state)
+        for _ in tqdm(range(sim.num_frames), desc='JAX'):
+            state = run_frame(state)
+        jax.block_until_ready(state.x)
+        elapsed = time.perf_counter() - t0
+    else:
+        t0 = time.perf_counter()
+        for _ in tqdm(range(sim.num_frames), desc='JAX'):
+            frames.append(np.array(state.x))  # implicit sync via host readback
+            t_frame = time.perf_counter()
+            state = run_frame(state)
             jax.block_until_ready(state.x)
-            timer.stop()
-
-            ft = timer.flush_frame()
-            frame_ms = sum(ft.values())
-            frame_timings.append(ft)
+            frame_ms = (time.perf_counter() - t_frame) * 1000
             frame_metrics.append({
                 'x_mean_z': float(state.x[:, 2].mean()),
                 'v_max': float(jnp.abs(state.v).max()),
                 'frame_ms': frame_ms,
-                **{f'{k}_ms': v for k, v in ft.items()},
+                'timestep_ms': frame_ms,
             })
-
         elapsed = time.perf_counter() - t0
-        cuda_profiler_stop()
-        total_steps = sim.num_frames * sim.steps_per_frame
-        return frames, elapsed, total_steps, timer.summary_from_frames(frame_timings), frame_metrics
 
-    # ---- per-stage path: Python loop over substeps, NO sync between stages ----
-    # Wall-clock timing only. The intra-substep stage syncs that used to live
-    # here gave a per-stage breakdown but added ~30 block_until_ready calls per
-    # frame and serialised the GPU stream artificially. One sync per frame is
-    # enough to make perf_counter() meaningful; use nsys/ncu when you actually
-    # need a per-stage breakdown.
-    if kernel_name == 'cuda_v2':
-        from mpm_jax.cuda.p2g_cuda import make_fused_stages
-        jit_p2g_stage, jit_grid_stage, jit_g2p_stage = make_fused_stages(
-            params, mat.elasticity, mat.plasticity, pre_fn, post_fn)
-    else:
-        jit_p2g_stage, jit_grid_stage, jit_g2p_stage = build_jit_stages(
-            params, elasticity_fn, plasticity_fn, pre_fn, post_fn, p2g_fn=p2g_fn)
-
-    # Warmup: one full substep through all stages, then the metric reads.
-    state = make_state()
-    grid_mv, grid_m, inter = jit_p2g_stage(state)
-    grid_v = jit_grid_stage(grid_mv, grid_m)
-    state = jit_g2p_stage(state, grid_v, inter)
-    jax.block_until_ready(state.x)
-    _warmup_metrics(state)
-
-    state = make_state()
-    timer = StageTimer()
-    frames = []
-    frame_metrics = []
-    frame_timings = []
-
-    cuda_profiler_start()
-    t0 = time.perf_counter()
-
-    for frame in tqdm(range(sim.num_frames), desc='JAX'):
-        if not bench:
-            frames.append(np.array(state.x))
-
-        timer.start('timestep')
-        for _ in range(sim.steps_per_frame):
-            grid_mv, grid_m, inter = jit_p2g_stage(state)
-            grid_v = jit_grid_stage(grid_mv, grid_m)
-            state = jit_g2p_stage(state, grid_v, inter)
-        jax.block_until_ready(state.x)
-        timer.stop()
-
-        ft = timer.flush_frame()
-        frame_ms = sum(ft.values())
-        frame_timings.append(ft)
-        frame_metrics.append({
-            'x_mean_z': float(state.x[:, 2].mean()),
-            'v_max': float(jnp.abs(state.v).max()),
-            'frame_ms': frame_ms,
-            **{f'{k}_ms': v for k, v in ft.items()},
-        })
-
-    elapsed = time.perf_counter() - t0
     cuda_profiler_stop()
     total_steps = sim.num_frames * sim.steps_per_frame
-    return frames, elapsed, total_steps, timer.summary_from_frames(frame_timings), frame_metrics
+    avg_frame_ms = elapsed / sim.num_frames * 1000
+    summary = {
+        'timestep': {
+            'mean_ms': avg_frame_ms,
+            'std_ms': 0.0,
+            'total_ms': elapsed * 1000,
+            'count': sim.num_frames,
+        }
+    }
+    return frames, elapsed, total_steps, summary, frame_metrics
 
 
 
