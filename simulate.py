@@ -489,8 +489,111 @@ def _extract_nsys_stats(cfg):
     print(f"Uploaded {report_path} as wandb artifact.")
 
 
+def _parse_ncu_csv(csv_path):
+    """Parse the long-format ncu CSV (`ncu --set full --csv` output).
+
+    The file is a regular CSV preceded by `==PROF==` status lines. Each
+    data row is (kernel invocation, metric) -> value. We collapse to a
+    per-kernel summary keyed on the demangled kernel name.
+
+    Returns a dict: {kernel_name: {
+        'launches': int,
+        'duration_us_total': float,
+        'duration_us_avg': float,
+        'metrics': {metric_name: [values...]},  # per-launch averages
+    }}
+    """
+    import csv
+    from collections import defaultdict
+
+    rows = []
+    header = None
+    with open(csv_path) as f:
+        # Skip ==PROF== / ==ERROR== prelude until we find the CSV header.
+        for line in f:
+            stripped = line.strip()
+            if stripped.startswith('"ID"') or stripped.startswith('ID,'):
+                header = next(csv.reader([line]))
+                break
+        if header is None:
+            return None
+        rows = list(csv.DictReader(f, fieldnames=header))
+
+    # Each kernel launch shows up as N rows (one per metric). Group on
+    # (kernel name, ID) so we can count distinct launches.
+    by_kernel = defaultdict(lambda: {'launch_ids': set(), 'metrics': defaultdict(list)})
+    for row in rows:
+        kname = row.get('Kernel Name') or ''
+        # Trim template args / argument list for readability.
+        kname_short = kname.split('(', 1)[0].strip()
+        if not kname_short:
+            continue
+        invocation_id = row.get('ID', '')
+        metric = row.get('Metric Name', '')
+        value_str = (row.get('Metric Value') or '').replace(',', '').strip()
+        unit = (row.get('Metric Unit') or '').strip()
+        try:
+            value = float(value_str)
+        except ValueError:
+            continue
+        # Normalise duration to microseconds.
+        if metric == 'gpu__time_duration.sum':
+            if unit == 'ns':
+                value /= 1000.0
+            elif unit == 'ms':
+                value *= 1000.0
+            elif unit == 's':
+                value *= 1e6
+            elif unit != 'us':
+                continue  # unknown unit, skip
+        by_kernel[kname_short]['launch_ids'].add(invocation_id)
+        by_kernel[kname_short]['metrics'][metric].append(value)
+
+    out = {}
+    for kname, data in by_kernel.items():
+        durations = data['metrics'].get('gpu__time_duration.sum', [])
+        out[kname] = {
+            'launches': len(data['launch_ids']),
+            'duration_us_total': sum(durations),
+            'duration_us_avg': (sum(durations) / len(durations)) if durations else 0.0,
+            'metrics': {m: vals for m, vals in data['metrics'].items()},
+        }
+    return out
+
+
+def _print_ncu_summary(summary):
+    """Pretty-print the dict returned by _parse_ncu_csv."""
+    if not summary:
+        print("(ncu summary is empty)")
+        return
+    total_us = sum(v['duration_us_total'] for v in summary.values()) or 1.0
+
+    # Headline columns. Show a couple of widely-available throughput metrics
+    # if present in the CSV.
+    print(f"\n{'Kernel':<40s} {'Launches':>9s} {'Avg µs':>10s} {'Total ms':>10s} {'% time':>7s}  "
+          f"{'SM%':>6s}  {'Mem%':>6s}  {'Occ%':>6s}")
+    print("-" * 110)
+
+    def _avg(vs):
+        return sum(vs) / len(vs) if vs else float('nan')
+
+    rows = sorted(summary.items(), key=lambda kv: -kv[1]['duration_us_total'])
+    for kname, d in rows:
+        sm_pct = _avg(d['metrics'].get('sm__throughput.avg.pct_of_peak_sustained_elapsed', []))
+        mem_pct = _avg(d['metrics'].get('gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed', []))
+        occ_pct = _avg(d['metrics'].get('sm__warps_active.avg.pct_of_peak_sustained_active', []))
+
+        def _fmt(x):
+            return f"{x:>5.1f}%" if x == x else "    —"  # NaN-safe
+
+        print(f"{kname[:40]:<40s} {d['launches']:>9d} "
+              f"{d['duration_us_avg']:>10.2f} {d['duration_us_total']/1000.0:>10.3f} "
+              f"{100.0 * d['duration_us_total']/total_us:>6.1f}%  "
+              f"{_fmt(sm_pct)}  {_fmt(mem_pct)}  {_fmt(occ_pct)}")
+
+
 def _extract_ncu_stats(cfg):
-    """Extract Nsight Compute CSV results and log to wandb."""
+    """Extract Nsight Compute CSV results, summarise, and log to wandb."""
     import glob
     from hydra.core.hydra_config import HydraConfig
 
@@ -506,15 +609,34 @@ def _extract_ncu_stats(cfg):
     csv_path = candidates[0]
     print(f"\nLoading ncu results from {csv_path}...")
 
-    try:
-        import pandas as pd
-        df = pd.read_csv(csv_path)
-        print(df.to_string(index=False))
-        wandb.log({"ncu_kernel_metrics": wandb.Table(dataframe=df)})
-    except Exception as e:
-        print(f"Failed to parse ncu CSV: {e}")
-        # Upload raw file anyway
-        pass
+    summary = _parse_ncu_csv(csv_path)
+    if not summary:
+        # Either no CSV header (None) or no kernel data (empty dict). Both
+        # usually mean ncu didn't get to run kernels — most commonly the
+        # driver-side perm gate (ERR_NVGPUCTRPERM, RmProfilingAdminOnly=1).
+        with open(csv_path) as f:
+            head = "".join(line for line, _ in zip(f, range(8)))
+        if "ERR_NVGPUCTRPERM" in head:
+            print("ncu collected no kernel data: the driver requires admin perf-counter access.")
+            print("On the host, reload the nvidia module with NVreg_RestrictProfilingToAdminUsers=0,")
+            print("or run inside an environment where the driver isn't locked down.")
+        else:
+            print("ncu produced no kernel data. First lines of the report:")
+            print("\n".join("  " + line.rstrip() for line in head.splitlines() if line.strip()))
+    else:
+        _print_ncu_summary(summary)
+        # Log to wandb as a flat table.
+        try:
+            table = wandb.Table(columns=["kernel", "launches", "avg_us", "total_ms", "pct_time"])
+            total_us = sum(v['duration_us_total'] for v in summary.values()) or 1.0
+            for kname, d in sorted(summary.items(), key=lambda kv: -kv[1]['duration_us_total']):
+                table.add_data(kname, d['launches'],
+                               round(d['duration_us_avg'], 2),
+                               round(d['duration_us_total'] / 1000.0, 3),
+                               round(100.0 * d['duration_us_total'] / total_us, 1))
+            wandb.log({"ncu_kernel_summary": table})
+        except Exception as e:
+            print(f"(wandb table upload failed: {e})")
 
     artifact = wandb.Artifact(
         f"ncu-{cfg.get('kernel', {}).get('name', 'jax')}-N{cfg.sim.n_particles}",
@@ -556,7 +678,10 @@ def main(cfg: DictConfig):
     jax_trace_dir = None
     if profile_name == 'jax':
         import jax
-        jax_trace_dir = os.path.join(os.getcwd(), "jax_trace")
+        from hydra.core.hydra_config import HydraConfig
+        # Same fix as the nsys/ncu path: Hydra >=1.2 doesn't chdir.
+        run_dir = os.path.abspath(HydraConfig.get().runtime.output_dir)
+        jax_trace_dir = os.path.join(run_dir, "jax_trace")
         jax.profiler.start_trace(jax_trace_dir)
         print(f"JAX profiler started -> {jax_trace_dir}")
 
