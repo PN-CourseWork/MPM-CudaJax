@@ -129,7 +129,9 @@ class StageTimer:
 def run_jax(cfg: DictConfig):
     import jax
     import jax.numpy as jnp
-    from mpm_jax.solver import (MPMState, make_params, build_jit_step, build_jit_frame)
+    from mpm_jax.solver import (
+        MPMState, make_params, build_jit_step, build_jit_frame, build_jit_stages,
+    )
     from mpm_jax.constitutive import get_constitutive
     from mpm_jax.boundary import build_boundary_fns
 
@@ -138,8 +140,12 @@ def run_jax(cfg: DictConfig):
     bench = cfg.get('benchmark', False)
     kernel_name = cfg.get('kernel', {}).get('name', 'jax')
 
-    # Build p2g_fn based on kernel config
-    p2g_fn = None  # None = default JAX implementation
+    # Build p2g_fn based on kernel config. cuda_v2 (fused) does its own thing
+    # because the kernel covers stress + plasticity + scatter and doesn't fit
+    # the (v, C, stress, weight, ...) -> (grid_mv, grid_m) signature.
+    p2g_fn = None         # None = default JAX implementation
+    fused_stages = None   # set only for cuda_v2
+
     if kernel_name == 'cuda_v1':
         from mpm_jax.cuda.p2g_cuda import make_cuda_p2g
         p2g_fn = make_cuda_p2g(sim.num_grids, kernel='scatter')
@@ -167,13 +173,11 @@ def run_jax(cfg: DictConfig):
             )
         print("Using CUDA P2G warp-reduction scatter kernel (v3)")
     elif kernel_name == 'cuda_v2':
-        from mpm_jax.cuda.p2g_cuda import is_available
-        if not is_available('fused'):
-            raise RuntimeError(
-                "kernel=cuda_v2 requested but CUDA kernel failed to compile/register. "
-                "Check nvcc is on PATH and module load gcc is done."
-            )
-        print("Using CUDA fused P2G kernel (v2)")
+        # cuda_v2 collapses stress / weights / compute / scatter / plasticity
+        # into a single CUDA kernel launch — no XLA-side intermediates.
+        # Implemented only on the per-stage path; per_frame would need a new
+        # build_jit_frame_fused() that we don't have.
+        print("Using CUDA fused P2G kernel (v2) — stress + scatter in one launch")
     else:
         print("Using JAX P2G kernel")
 
@@ -201,11 +205,9 @@ def run_jax(cfg: DictConfig):
     elasticity_fn = get_constitutive(mat.elasticity)
     plasticity_fn = get_constitutive(mat.plasticity)
 
-    # Build JIT-compiled step and frame functions
-    jit_step = build_jit_step(params, elasticity_fn, plasticity_fn,
-                               pre_fn, post_fn, p2g_fn=p2g_fn)
-    jit_frame = build_jit_frame(params, elasticity_fn, plasticity_fn,
-                                 pre_fn, post_fn, sim.steps_per_frame, p2g_fn=p2g_fn)
+    timing_mode = cfg.get('timing_mode', 'per_frame')
+    assert timing_mode in ('per_frame', 'per_stage'), \
+        f"timing_mode must be 'per_frame' or 'per_stage', got {timing_mode!r}"
 
     def make_state():
         return MPMState(
@@ -215,50 +217,106 @@ def run_jax(cfg: DictConfig):
             F=jnp.tile(jnp.eye(3), (n, 1, 1)),
         )
 
-    # Warmup JIT compilation
-    state = make_state()
-    state = jit_step(state)
-    jax.block_until_ready(state.x)
-    state = make_state()
-    state = jit_frame(state)
-    jax.block_until_ready(state.x)
+    if kernel_name == 'cuda_v2' and timing_mode == 'per_frame':
+        raise RuntimeError(
+            "kernel=cuda_v2 (fused) is only wired into the per-stage path. "
+            "Run with timing_mode=per_stage."
+        )
 
-    # Reset and time
+    def _warmup_metrics(s):
+        """Compile the per-frame metric reads so the first timed frame doesn't
+        eat a one-shot trace+compile on jnp.mean / jnp.abs.max."""
+        _ = float(s.x[:, 2].mean())
+        _ = float(jnp.abs(s.v).max())
+
+    # ---- Build the substep function for whichever timing_mode is selected ----
+    if timing_mode == 'per_frame':
+        jit_step = build_jit_step(params, elasticity_fn, plasticity_fn,
+                                  pre_fn, post_fn, p2g_fn=p2g_fn)
+        jit_frame = build_jit_frame(params, elasticity_fn, plasticity_fn,
+                                    pre_fn, post_fn, sim.steps_per_frame, p2g_fn=p2g_fn)
+
+        def run_frame(s):
+            return jit_frame(s)
+
+        # Warmup: trace+compile everything we'll use in the timed region.
+        state = make_state()
+        state = jit_step(state); jax.block_until_ready(state.x)
+        state = make_state()
+        state = jit_frame(state); jax.block_until_ready(state.x)
+        _warmup_metrics(state)
+    else:  # per_stage
+        if kernel_name == 'cuda_v2':
+            from mpm_jax.cuda.p2g_cuda import make_fused_stages
+            jit_p2g_stage, jit_grid_stage, jit_g2p_stage = make_fused_stages(
+                params, mat.elasticity, mat.plasticity, pre_fn, post_fn)
+        else:
+            jit_p2g_stage, jit_grid_stage, jit_g2p_stage = build_jit_stages(
+                params, elasticity_fn, plasticity_fn, pre_fn, post_fn, p2g_fn=p2g_fn)
+
+        def run_frame(s):
+            for _ in range(sim.steps_per_frame):
+                grid_mv, grid_m, inter = jit_p2g_stage(s)
+                grid_v = jit_grid_stage(grid_mv, grid_m)
+                s = jit_g2p_stage(s, grid_v, inter)
+            return s
+
+        state = make_state()
+        grid_mv, grid_m, inter = jit_p2g_stage(state)
+        grid_v = jit_grid_stage(grid_mv, grid_m)
+        state = jit_g2p_stage(state, grid_v, inter)
+        jax.block_until_ready(state.x)
+        _warmup_metrics(state)
+
+    # ---- Timed region ----
+    # Benchmark mode: dispatch every frame back-to-back with no intra-loop
+    # sync. JAX queues the work on its stream; we block once at the end and
+    # divide elapsed by num_frames for the average. This gives the GPU the
+    # most freedom to pipeline launches.
+    #
+    # Non-benchmark mode (GIF rendering): we have to materialise state.x
+    # to host every frame to capture the trajectory, which forces a sync
+    # per frame anyway. Keep the per-frame metrics in that path.
     state = make_state()
-    timer = StageTimer()
     frames = []
     frame_metrics = []
-    frame_timings = []
 
-    # Always bracket the hot loop with profiler markers.
-    # No-ops if not running under nsys.
     cuda_profiler_start()
-    t0 = time.perf_counter()
 
-    for frame in tqdm(range(sim.num_frames), desc='JAX'):
-        if not bench:
-            frames.append(np.array(state.x))
-
-        timer.start('timestep')
-        state = jit_frame(state)
+    if bench:
+        t0 = time.perf_counter()
+        for _ in tqdm(range(sim.num_frames), desc='JAX'):
+            state = run_frame(state)
         jax.block_until_ready(state.x)
-        timer.stop()
-
-        ft = timer.flush_frame()
-        frame_ms = sum(ft.values())
-        frame_timings.append(ft)
-        frame_metrics.append({
-            'x_mean_z': float(state.x[:, 2].mean()),
-            'v_max': float(jnp.abs(state.v).max()),
-            'frame_ms': frame_ms,
-            **{f'{k}_ms': v for k, v in ft.items()},
-        })
-
-    elapsed = time.perf_counter() - t0
+        elapsed = time.perf_counter() - t0
+    else:
+        t0 = time.perf_counter()
+        for _ in tqdm(range(sim.num_frames), desc='JAX'):
+            frames.append(np.array(state.x))  # implicit sync via host readback
+            t_frame = time.perf_counter()
+            state = run_frame(state)
+            jax.block_until_ready(state.x)
+            frame_ms = (time.perf_counter() - t_frame) * 1000
+            frame_metrics.append({
+                'x_mean_z': float(state.x[:, 2].mean()),
+                'v_max': float(jnp.abs(state.v).max()),
+                'frame_ms': frame_ms,
+                'timestep_ms': frame_ms,
+            })
+        elapsed = time.perf_counter() - t0
 
     cuda_profiler_stop()
     total_steps = sim.num_frames * sim.steps_per_frame
-    return frames, elapsed, total_steps, timer.summary_from_frames(frame_timings), frame_metrics
+    avg_frame_ms = elapsed / sim.num_frames * 1000
+    summary = {
+        'timestep': {
+            'mean_ms': avg_frame_ms,
+            'std_ms': 0.0,
+            'total_ms': elapsed * 1000,
+            'count': sim.num_frames,
+        }
+    }
+    return frames, elapsed, total_steps, summary, frame_metrics
 
 
 
@@ -319,15 +377,28 @@ def _is_inside_profiler():
 
 
 def _relaunch_under_profiler(profile_name, cfg):
-    """Re-launch this process under nsys or ncu. Exits when done."""
+    """Re-launch this process under nsys or ncu. Exits when done.
+
+    The .nsys-rep / .csv is written into the Hydra run output dir, and the
+    inner Python process is told to reuse the same dir so its simulate.log
+    / wandb files end up next to the profile report.
+    """
     import sys
+    from hydra.core.hydra_config import HydraConfig
 
     kernel_name = cfg.get('kernel', {}).get('name', 'jax')
     N = cfg.sim.n_particles
-    report_name = f"profile_{kernel_name}_N{N}"
 
-    # Build the inner command (same args, but with env marker)
-    inner_cmd = [sys.executable] + sys.argv
+    # Hydra ≥1.2 doesn't chdir by default — get the run output dir from the
+    # HydraConfig API instead of trusting os.getcwd().
+    outer_outdir = os.path.abspath(HydraConfig.get().runtime.output_dir)
+    os.makedirs(outer_outdir, exist_ok=True)
+    report_stem = os.path.join(outer_outdir, f"profile_{kernel_name}_N{N}")
+
+    inner_cmd = [sys.executable] + sys.argv + [
+        f"hydra.run.dir={outer_outdir}",
+        "hydra.output_subdir=null",  # avoid stomping on the outer .hydra/
+    ]
 
     if profile_name == "nsys":
         wrapper = [
@@ -337,14 +408,14 @@ def _relaunch_under_profiler(profile_name, cfg):
             "--trace=cuda,nvtx",
             "--stats=true",
             "--force-overwrite=true",
-            "-o", report_name,
+            "-o", report_stem,  # absolute path; nsys appends .nsys-rep
         ]
     elif profile_name == "ncu":
         wrapper = [
             "ncu",
             "--set", "full",
             "--csv",
-            "--log-file", f"{report_name}.csv",
+            "--log-file", f"{report_stem}.csv",
             "--force-overwrite",
         ]
     else:
@@ -363,9 +434,13 @@ def _extract_nsys_stats(cfg):
     """Extract kernel timings from the nsys .nsys-rep file and log to wandb."""
     import glob
     import io
+    from hydra.core.hydra_config import HydraConfig
 
-    candidates = sorted(glob.glob("profile_*.nsys-rep") + glob.glob("*.nsys-rep"),
-                        key=os.path.getmtime, reverse=True)
+    outdir = os.path.abspath(HydraConfig.get().runtime.output_dir)
+    candidates = sorted(
+        glob.glob(os.path.join(outdir, "profile_*.nsys-rep")),
+        key=os.path.getmtime, reverse=True,
+    )
     if not candidates:
         print("No .nsys-rep file found.")
         return
@@ -417,8 +492,13 @@ def _extract_nsys_stats(cfg):
 def _extract_ncu_stats(cfg):
     """Extract Nsight Compute CSV results and log to wandb."""
     import glob
+    from hydra.core.hydra_config import HydraConfig
 
-    candidates = sorted(glob.glob("profile_*.csv"), key=os.path.getmtime, reverse=True)
+    outdir = os.path.abspath(HydraConfig.get().runtime.output_dir)
+    candidates = sorted(
+        glob.glob(os.path.join(outdir, "profile_*.csv")),
+        key=os.path.getmtime, reverse=True,
+    )
     if not candidates:
         print("No ncu CSV file found.")
         return
