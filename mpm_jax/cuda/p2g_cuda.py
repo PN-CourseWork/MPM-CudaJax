@@ -79,6 +79,10 @@ def _register_fused():
     return _register("p2g_fused_cuda", "libp2g_fused.so", "P2GFused")
 
 
+def _register_g2p_fused():
+    return _register("g2p_fused_cuda", "libg2p_fused.so", "G2PFused")
+
+
 def cuda_p2g_scatter(mv, m, index, num_grids):
     """CUDA P2G scatter via JAX FFI.
 
@@ -198,7 +202,42 @@ def is_available(kernel='scatter'):
         return _register_smem()
     elif kernel == 'fused':
         return _register_fused()
+    elif kernel == 'g2p_fused':
+        return _register_g2p_fused()
     return False
+
+
+def cuda_g2p_fused(x, F, grid_v, num_grids, dt, inv_dx, dx, clip_bound):
+    """Fused CUDA G2P via JAX FFI.
+
+    Each thread computes its own B-spline weights in registers, gathers
+    27 grid velocities, and produces (new_x, new_v, new_C, new_F) — no
+    (N, 27, *) tensors materialised in HBM.
+    """
+    N = x.shape[0]
+    G = num_grids
+    F_flat = F.reshape(N, 9)
+
+    new_x, new_v, new_C_flat, new_F_flat = jax.ffi.ffi_call(
+        "g2p_fused_cuda",
+        (
+            jax.ShapeDtypeStruct((N, 3), jnp.float32),
+            jax.ShapeDtypeStruct((N, 3), jnp.float32),
+            jax.ShapeDtypeStruct((N, 9), jnp.float32),
+            jax.ShapeDtypeStruct((N, 9), jnp.float32),
+        ),
+        vmap_method="broadcast_all",
+    )(
+        x, F_flat, grid_v,
+        N=np.int32(N),
+        G=np.int32(G),
+        dt=np.float32(dt),
+        inv_dx=np.float32(inv_dx),
+        dx=np.float32(dx),
+        clip_bound=np.float32(clip_bound),
+    )
+
+    return new_x, new_v, new_C_flat.reshape(N, 3, 3), new_F_flat.reshape(N, 3, 3)
 
 
 def make_cuda_p2g(num_grids, kernel='scatter'):
@@ -271,7 +310,11 @@ def make_fused_stages(params, elasticity_cfg, plasticity_cfg, pre_particle_fn, p
     """
     if not is_available('fused'):
         raise RuntimeError(
-            "cuda_v2 fused kernel is not registered (missing .so?). "
+            "cuda_v2 fused P2G kernel is not registered (missing .so?). "
+            "Run `uv sync --extra jax-cuda` to build.")
+    if not is_available('g2p_fused'):
+        raise RuntimeError(
+            "cuda_v2 fused G2P kernel is not registered (missing .so?). "
             "Run `uv sync --extra jax-cuda` to build.")
 
     if elasticity_cfg.name != "CorotatedElasticity":
@@ -301,8 +344,8 @@ def make_fused_stages(params, elasticity_cfg, plasticity_cfg, pre_particle_fn, p
 
     # Late imports to avoid circular dep at module load.
     from mpm_jax.solver import (
-        MPMState, StepIntermediates, compute_weights_and_indices,
-        grid_update as grid_update_fn, g2p as g2p_fn,
+        MPMState, StepIntermediates,
+        grid_update as grid_update_fn,
     )
 
     @jax.jit
@@ -327,17 +370,13 @@ def make_fused_stages(params, elasticity_cfg, plasticity_cfg, pre_particle_fn, p
 
     @jax.jit
     def jit_g2p_no_plast_stage(state, grid_v, inter):
-        # Recompute weights from x_post_bc (the fused kernel already computed
-        # them internally and discarded; recomputing here in JAX costs
-        # ~50 flops/particle and saves ~1100 bytes/particle of HBM).
-        weight, dweight, dpos, index = compute_weights_and_indices(
-            inter.x_post_bc, params.inv_dx, params.dx, params.num_grids)
-        # F_pre_plast in the intermediates is the kernel's already-corrected F,
-        # so we feed it straight into G2P and don't re-apply plasticity here.
-        new_x, new_v, new_C, new_F = g2p_fn(
-            grid_v, weight, dweight, dpos, index,
-            inter.F_pre_plast, inter.x_post_bc,
-            params.dt, params.inv_dx, params.clip_bound)
+        # Fully fused: each thread does its own B-spline math + gather
+        # in registers. No (N, 27, *) tensors anywhere on this stage.
+        new_x, new_v, new_C, new_F = cuda_g2p_fused(
+            inter.x_post_bc, inter.F_pre_plast, grid_v,
+            params.num_grids, params.dt, params.inv_dx, params.dx,
+            params.clip_bound,
+        )
         return MPMState(x=new_x, v=new_v, C=new_C, F=new_F)
 
     return jit_p2g_fused_stage, jit_grid_stage, jit_g2p_no_plast_stage
