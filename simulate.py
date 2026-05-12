@@ -377,15 +377,28 @@ def _is_inside_profiler():
 
 
 def _relaunch_under_profiler(profile_name, cfg):
-    """Re-launch this process under nsys or ncu. Exits when done."""
+    """Re-launch this process under nsys or ncu. Exits when done.
+
+    The .nsys-rep / .csv is written into the Hydra run output dir, and the
+    inner Python process is told to reuse the same dir so its simulate.log
+    / wandb files end up next to the profile report.
+    """
     import sys
+    from hydra.core.hydra_config import HydraConfig
 
     kernel_name = cfg.get('kernel', {}).get('name', 'jax')
     N = cfg.sim.n_particles
-    report_name = f"profile_{kernel_name}_N{N}"
 
-    # Build the inner command (same args, but with env marker)
-    inner_cmd = [sys.executable] + sys.argv
+    # Hydra ≥1.2 doesn't chdir by default — get the run output dir from the
+    # HydraConfig API instead of trusting os.getcwd().
+    outer_outdir = os.path.abspath(HydraConfig.get().runtime.output_dir)
+    os.makedirs(outer_outdir, exist_ok=True)
+    report_stem = os.path.join(outer_outdir, f"profile_{kernel_name}_N{N}")
+
+    inner_cmd = [sys.executable] + sys.argv + [
+        f"hydra.run.dir={outer_outdir}",
+        "hydra.output_subdir=null",  # avoid stomping on the outer .hydra/
+    ]
 
     if profile_name == "nsys":
         wrapper = [
@@ -395,14 +408,14 @@ def _relaunch_under_profiler(profile_name, cfg):
             "--trace=cuda,nvtx",
             "--stats=true",
             "--force-overwrite=true",
-            "-o", report_name,
+            "-o", report_stem,  # absolute path; nsys appends .nsys-rep
         ]
     elif profile_name == "ncu":
         wrapper = [
             "ncu",
             "--set", "full",
             "--csv",
-            "--log-file", f"{report_name}.csv",
+            "--log-file", f"{report_stem}.csv",
             "--force-overwrite",
         ]
     else:
@@ -421,9 +434,13 @@ def _extract_nsys_stats(cfg):
     """Extract kernel timings from the nsys .nsys-rep file and log to wandb."""
     import glob
     import io
+    from hydra.core.hydra_config import HydraConfig
 
-    candidates = sorted(glob.glob("profile_*.nsys-rep") + glob.glob("*.nsys-rep"),
-                        key=os.path.getmtime, reverse=True)
+    outdir = os.path.abspath(HydraConfig.get().runtime.output_dir)
+    candidates = sorted(
+        glob.glob(os.path.join(outdir, "profile_*.nsys-rep")),
+        key=os.path.getmtime, reverse=True,
+    )
     if not candidates:
         print("No .nsys-rep file found.")
         return
@@ -475,8 +492,13 @@ def _extract_nsys_stats(cfg):
 def _extract_ncu_stats(cfg):
     """Extract Nsight Compute CSV results and log to wandb."""
     import glob
+    from hydra.core.hydra_config import HydraConfig
 
-    candidates = sorted(glob.glob("profile_*.csv"), key=os.path.getmtime, reverse=True)
+    outdir = os.path.abspath(HydraConfig.get().runtime.output_dir)
+    candidates = sorted(
+        glob.glob(os.path.join(outdir, "profile_*.csv")),
+        key=os.path.getmtime, reverse=True,
+    )
     if not candidates:
         print("No ncu CSV file found.")
         return

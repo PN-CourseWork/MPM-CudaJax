@@ -196,15 +196,45 @@ parsers see the structure they expect.
 
 ## Profiling
 
+Three profilers are wired in via the `profile=` config:
+
 ```bash
-uv run --extra jax-cuda python simulate.py profile=nsys benchmark=true
-uv run --extra jax-cuda python simulate.py profile=ncu  sim.num_frames=1 benchmark=true
-uv run --extra jax-cuda python simulate.py profile=jax  benchmark=true
+uv run --extra jax-cuda python simulate.py profile=nsys benchmark=true \
+    kernel=cuda_v2 timing_mode=per_stage sim.n_particles=200000
+
+uv run --extra jax-cuda python simulate.py profile=ncu  benchmark=true \
+    kernel=cuda_v2 timing_mode=per_stage sim.n_particles=10000 sim.num_frames=1
+
+uv run --extra jax-cuda python simulate.py profile=jax  benchmark=true \
+    kernel=cuda_v2 timing_mode=per_stage
 ```
 
-`nsys` / `ncu` auto-relaunch this process under the profiler (gated by
-`_MPM_INSIDE_PROFILER` env var). Results are uploaded to wandb as
-artifacts. `profile=jax` writes a TensorBoard-readable trace.
+For `nsys` / `ncu`, `simulate.py` **re-launches itself under the profiler**
+(gated by an `_MPM_INSIDE_PROFILER` env var so the inner process knows
+not to do the same thing again). The inner process is passed
+`hydra.run.dir=<outer_outdir>` so its simulate.log, wandb run, and the
+profile report all land in the same Hydra run dir:
+
+```
+outputs/<YYYY-MM-DD>/<HH-MM-SS>/
+  ├── .hydra/                         # config snapshot
+  ├── simulate.log                    # python output
+  ├── profile_cuda_v2_N200000.nsys-rep   # (with profile=nsys)
+  └── profile_cuda_v2_N10000.csv         # (with profile=ncu)
+```
+
+The report is also uploaded to wandb as an artifact (with `profile=jax`,
+the TensorBoard trace dir is the artifact). Use the multirun output dir
+naming for sweeps: each Hydra run gets its own subdir under
+`multirun/<date>/<run>/`, with the same colocated structure.
+
+Notes:
+- `ncu --set full` instruments every kernel and is very slow — use
+  `sim.num_frames=1` (and a small `sim.n_particles`) so it finishes.
+- `nsys` only collects between `cudaProfilerStart` / `cudaProfilerStop`
+  brackets (managed for you in `simulate.py`).
+- For sweeps, profile one kernel at a time — `profile=nsys -cn sweep_*`
+  will launch each combination under nsys independently.
 
 `simulate.py` itself does not produce a per-stage timing breakdown in
 benchmark mode — only total wall-clock. Use nsys/ncu when you need to
