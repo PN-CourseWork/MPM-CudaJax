@@ -169,6 +169,8 @@ def cuda_p2g_fused(x, v, C, F, num_grids, dt, vol, p_mass, inv_dx, dx,
             jax.ShapeDtypeStruct((N, 9), jnp.float32),
         ),
         vmap_method="broadcast_all",
+    )(
+        x, v, C_flat, F_flat,
         N=np.int32(N),
         G=np.int32(G),
         dt=np.float32(dt),
@@ -181,7 +183,7 @@ def cuda_p2g_fused(x, v, C, F, num_grids, dt, vol, p_mass, inv_dx, dx,
         theta_c=np.float32(theta_c),
         theta_s=np.float32(theta_s),
         hardening_coeff=np.float32(hardening),
-    )(x, v, C_flat, F_flat)
+    )
 
     return grid_mv, grid_m, F_out_flat.reshape(N, 3, 3)
 
@@ -244,7 +246,99 @@ def make_cuda_p2g(num_grids, kernel='scatter'):
     elif kernel == 'fused':
         if not is_available('fused'):
             return None
-        logger.info("Fused CUDA P2G registered - use cuda_p2g_fused() directly")
+        logger.info("Fused CUDA P2G registered - use make_fused_stages()")
         return None  # handled specially in the driver
 
     return None
+
+
+def make_fused_stages(params, elasticity_cfg, plasticity_cfg, pre_particle_fn, post_grid_fn):
+    """Build per-stage JIT'd functions for the cuda_v2 fused kernel.
+
+    The fused kernel does SVD + plasticity + corotated stress + APIC + scatter
+    in one launch. Differences vs the standard per-stage path:
+      * No separate stress / weights / p2g_compute / p2g_scatter calls.
+      * Plasticity is applied at the START of the step (kernel returns the
+        corrected F). The G2P stage uses that corrected F and skips the
+        separate plasticity_fn call.
+      * Constitutive model is hard-coded to Corotated elasticity with snow-
+        style singular-value clamping (Stomakhin 2013). Identity plasticity
+        is realised by setting theta_c = theta_s = 1e9 (no clamp).
+
+    Returns (jit_p2g_fused_stage, jit_grid_stage, jit_g2p_no_plast_stage)
+    or raises if the kernel isn't available or the material config is
+    unsupported.
+    """
+    if not is_available('fused'):
+        raise RuntimeError(
+            "cuda_v2 fused kernel is not registered (missing .so?). "
+            "Run `uv sync --extra jax-cuda` to build.")
+
+    if elasticity_cfg.name != "CorotatedElasticity":
+        raise NotImplementedError(
+            f"cuda_v2 fused kernel only supports CorotatedElasticity, "
+            f"got {elasticity_cfg.name}.")
+
+    # Map plasticity config to (theta_c, theta_s, hardening_coeff). The kernel
+    # implements snow-style clamping; with theta_c=theta_s=1e9 there's no clamp,
+    # i.e. effectively identity plasticity.
+    plast_name = plasticity_cfg.name
+    if plast_name == "IdentityPlasticity":
+        theta_c, theta_s, hardening = 1e9, 1e9, 0.0
+    elif plast_name == "SnowPlasticity":
+        theta_c = float(plasticity_cfg.get("theta_c", 0.025))
+        theta_s = float(plasticity_cfg.get("theta_s", 0.0075))
+        hardening = float(plasticity_cfg.get("hardening", 10.0))
+    else:
+        raise NotImplementedError(
+            f"cuda_v2 fused kernel only supports IdentityPlasticity or "
+            f"SnowPlasticity, got {plast_name}.")
+
+    E = float(elasticity_cfg.E)
+    nu = float(elasticity_cfg.nu)
+    mu_0 = E / (2.0 * (1.0 + nu))
+    lambda_0 = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
+
+    # Late imports to avoid circular dep at module load.
+    from mpm_jax.solver import (
+        MPMState, StepIntermediates, compute_weights_and_indices,
+        grid_update as grid_update_fn, g2p as g2p_fn,
+    )
+
+    @jax.jit
+    def jit_p2g_fused_stage(state):
+        x, v = pre_particle_fn(state.x, state.v, 0.0)
+        grid_mv, grid_m, F_corrected = cuda_p2g_fused(
+            x, v, state.C, state.F,
+            params.num_grids, params.dt, params.vol, params.p_mass,
+            params.inv_dx, params.dx,
+            mu_0, lambda_0, theta_c, theta_s, hardening,
+        )
+        # G2P still needs weights/indices. Recomputed here in JAX (cheap
+        # B-spline math, no SVD) since the fused kernel discards them.
+        weight, dweight, dpos, index = compute_weights_and_indices(
+            x, params.inv_dx, params.dx, params.num_grids)
+        inter = StepIntermediates(
+            weight=weight, dweight=dweight, dpos=dpos, index=index,
+            x_post_bc=x, F_pre_plast=F_corrected,
+        )
+        return grid_mv, grid_m, inter
+
+    @jax.jit
+    def jit_grid_stage(grid_mv, grid_m):
+        grid_mv_normalized = grid_update_fn(
+            grid_mv, grid_m, params.gravity, params.dt, params.damping)
+        grid_v = post_grid_fn(grid_mv_normalized, grid_m, 0.0)
+        return grid_v
+
+    @jax.jit
+    def jit_g2p_no_plast_stage(state, grid_v, inter):
+        # F_pre_plast in the intermediates is the kernel's already-corrected F,
+        # so we feed it straight into G2P and don't re-apply plasticity here.
+        new_x, new_v, new_C, new_F = g2p_fn(
+            grid_v, inter.weight, inter.dweight, inter.dpos, inter.index,
+            inter.F_pre_plast, inter.x_post_bc,
+            params.dt, params.inv_dx, params.clip_bound)
+        return MPMState(x=new_x, v=new_v, C=new_C, F=new_F)
+
+    return jit_p2g_fused_stage, jit_grid_stage, jit_g2p_no_plast_stage

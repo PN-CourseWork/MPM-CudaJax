@@ -1,0 +1,20 @@
+# cuda_v2 fused-kernel benchmark sweep (per-stage path only).
+# Pair this with sweep_per_stage to get the full apples-to-apples comparison.
+# Usage: uv run --extra jax-cuda python simulate.py -cn sweep_cuda_v2
+defaults:
+  - config
+  - override /kernel: cuda_v2
+  - _self_
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      sim.n_particles: 5000,50000,200000,500000
+
+benchmark: true
+tag: cuda_v2_sweep
+timing_mode: per_stage
+sim:
+  num_frames: 5
+  num_grids: 64

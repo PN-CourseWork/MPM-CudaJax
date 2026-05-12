@@ -140,8 +140,12 @@ def run_jax(cfg: DictConfig):
     bench = cfg.get('benchmark', False)
     kernel_name = cfg.get('kernel', {}).get('name', 'jax')
 
-    # Build p2g_fn based on kernel config
-    p2g_fn = None  # None = default JAX implementation
+    # Build p2g_fn based on kernel config. cuda_v2 (fused) does its own thing
+    # because the kernel covers stress + plasticity + scatter and doesn't fit
+    # the (v, C, stress, weight, ...) -> (grid_mv, grid_m) signature.
+    p2g_fn = None         # None = default JAX implementation
+    fused_stages = None   # set only for cuda_v2
+
     if kernel_name == 'cuda_v1':
         from mpm_jax.cuda.p2g_cuda import make_cuda_p2g
         p2g_fn = make_cuda_p2g(sim.num_grids, kernel='scatter')
@@ -169,13 +173,11 @@ def run_jax(cfg: DictConfig):
             )
         print("Using CUDA P2G warp-reduction scatter kernel (v3)")
     elif kernel_name == 'cuda_v2':
-        from mpm_jax.cuda.p2g_cuda import is_available
-        if not is_available('fused'):
-            raise RuntimeError(
-                "kernel=cuda_v2 requested but CUDA kernel failed to compile/register. "
-                "Check nvcc is on PATH and module load gcc is done."
-            )
-        print("Using CUDA fused P2G kernel (v2)")
+        # cuda_v2 collapses stress / weights / compute / scatter / plasticity
+        # into a single CUDA kernel launch — no XLA-side intermediates.
+        # Implemented only on the per-stage path; per_frame would need a new
+        # build_jit_frame_fused() that we don't have.
+        print("Using CUDA fused P2G kernel (v2) — stress + scatter in one launch")
     else:
         print("Using JAX P2G kernel")
 
@@ -213,6 +215,12 @@ def run_jax(cfg: DictConfig):
             v=jnp.broadcast_to(jnp.array(list(sim.initial_velocity)), (n, 3)).copy(),
             C=jnp.zeros((n, 3, 3)),
             F=jnp.tile(jnp.eye(3), (n, 1, 1)),
+        )
+
+    if kernel_name == 'cuda_v2' and timing_mode == 'per_frame':
+        raise RuntimeError(
+            "kernel=cuda_v2 (fused) is only wired into the per-stage path. "
+            "Run with timing_mode=per_stage."
         )
 
     if timing_mode == 'per_frame':
@@ -264,8 +272,13 @@ def run_jax(cfg: DictConfig):
         return frames, elapsed, total_steps, timer.summary_from_frames(frame_timings), frame_metrics
 
     # ---- per-stage path: Python loop over substeps, sync between stages ----
-    jit_p2g_stage, jit_grid_stage, jit_g2p_stage = build_jit_stages(
-        params, elasticity_fn, plasticity_fn, pre_fn, post_fn, p2g_fn=p2g_fn)
+    if kernel_name == 'cuda_v2':
+        from mpm_jax.cuda.p2g_cuda import make_fused_stages
+        jit_p2g_stage, jit_grid_stage, jit_g2p_stage = make_fused_stages(
+            params, mat.elasticity, mat.plasticity, pre_fn, post_fn)
+    else:
+        jit_p2g_stage, jit_grid_stage, jit_g2p_stage = build_jit_stages(
+            params, elasticity_fn, plasticity_fn, pre_fn, post_fn, p2g_fn=p2g_fn)
 
     # Warmup each stage
     state = make_state()
