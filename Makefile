@@ -43,6 +43,7 @@ sweep-all:
 
 clean:
 	rm -f mpm_jax/cuda/kernels/*.so
+	rm -rf build/ffi
 	rm -rf multirun/ outputs/ wandb/
 	rm -f *.nsys-rep *.sqlite
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

@@ -25,7 +25,9 @@ export NVCC=/appl/nvhpc/2024_249/Linux_aarch64/24.9/cuda/bin/nvcc
 uv run --extra jax-cuda python simulate.py sim.num_frames=5 benchmark=true
 ```
 
-CUDA kernels auto-compile on first use when `nvcc` is on PATH.
+CUDA kernels auto-compile on first use when `nvcc` is on PATH. Compiled shared
+libraries are cached under `build/ffi` by default; set `MPM_FFI_CACHE` to use a
+different cache directory.
 
 ## Usage
 
@@ -137,7 +139,7 @@ Three embarrassingly parallel phases per timestep:
 
 Each phase is a `jax.vmap` over a single-particle function. The entire frame (multiple substeps) is JIT-compiled as one XLA program via `jax.lax.scan` — zero Python overhead.
 
-The P2G scatter (the only cross-particle reduction) is the CUDA optimisation target. Kernels integrate via `jax.ffi` for zero-copy GPU memory access on the correct CUDA stream. They auto-compile from `.cu` source on first use.
+The P2G scatter (the only cross-particle reduction) is the CUDA optimisation target. Kernels integrate via `jax.ffi` for zero-copy GPU memory access on the correct CUDA stream. They auto-compile from `.cu` source on first use and cache the resulting shared libraries under `build/ffi`.
 
 ## References
 

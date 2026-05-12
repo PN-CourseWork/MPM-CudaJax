@@ -1,7 +1,8 @@
 """CUDA P2G kernels, integrated via JAX FFI.
 
 Kernels are compiled automatically from .cu source on first use (requires
-nvcc on PATH). The compiled .so is cached next to the source file.
+nvcc on PATH). The compiled .so is cached in build/ffi by default, or in
+MPM_FFI_CACHE when that environment variable is set.
 """
 
 import os
@@ -9,6 +10,8 @@ import subprocess
 import ctypes
 import logging
 import shutil
+from pathlib import Path
+from threading import Lock
 
 import jax
 import jax.numpy as jnp
@@ -16,21 +19,43 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_KERNEL_DIR = os.path.join(os.path.dirname(__file__), "kernels")
+_PACKAGE_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _PACKAGE_DIR.parents[1]
+_KERNEL_DIR = _PACKAGE_DIR / "kernels"
+_FFI_CACHE_ENV = "MPM_FFI_CACHE"
 _REGISTERED = {}
+_REGISTER_LOCK = Lock()
+
+
+def _ffi_cache_dir() -> Path:
+    cache_root = os.environ.get(_FFI_CACHE_ENV)
+    if cache_root:
+        path = Path(cache_root).expanduser()
+    else:
+        path = _PROJECT_ROOT / "build" / "ffi"
+    path.mkdir(parents=True, exist_ok=True)
+    return path.resolve()
+
+
+def _kernel_source_path(cu_name) -> Path:
+    return _KERNEL_DIR / cu_name
+
+
+def _shared_library_path(so_name) -> Path:
+    return _ffi_cache_dir() / so_name
 
 
 def _compile_kernel(cu_name, so_name):
     """Compile a .cu file to .so using nvcc. Returns True on success."""
-    cu_path = os.path.join(_KERNEL_DIR, cu_name)
-    so_path = os.path.join(_KERNEL_DIR, so_name)
+    cu_path = _kernel_source_path(cu_name)
+    so_path = _shared_library_path(so_name)
 
     # Skip if .so exists and is newer than .cu
-    if os.path.exists(so_path):
-        if os.path.getmtime(so_path) > os.path.getmtime(cu_path):
+    if so_path.exists():
+        if so_path.stat().st_mtime > cu_path.stat().st_mtime:
             return True
 
-    if not os.path.exists(cu_path):
+    if not cu_path.exists():
         logger.error("CUDA source not found: %s", cu_path)
         return False
 
@@ -76,7 +101,7 @@ def _compile_kernel(cu_name, so_name):
     ]
     if gcc_lib_dir:
         cmd.extend(["-Xlinker", "-rpath", "-Xlinker", gcc_lib_dir])
-    cmd.extend(["-o", so_path, cu_path])
+    cmd.extend(["-o", str(so_path), str(cu_path)])
 
     logger.info("Compiling %s -> %s", cu_name, so_name)
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -90,29 +115,31 @@ def _compile_kernel(cu_name, so_name):
 
 def _register(name, cu_name, so_name, symbol):
     """Compile if needed, load .so, and register FFI target."""
-    if name in _REGISTERED:
-        return _REGISTERED[name]
+    with _REGISTER_LOCK:
+        if name in _REGISTERED:
+            return _REGISTERED[name]
 
-    # Auto-compile
-    if not _compile_kernel(cu_name, so_name):
-        _REGISTERED[name] = False
-        return False
+        # Auto-compile
+        if not _compile_kernel(cu_name, so_name):
+            _REGISTERED[name] = False
+            return False
 
-    so_path = os.path.join(_KERNEL_DIR, so_name)
-    try:
-        lib = ctypes.cdll.LoadLibrary(so_path)
-        jax.ffi.register_ffi_target(
-            name,
-            jax.ffi.pycapsule(getattr(lib, symbol)),
-            platform="CUDA",
-        )
-        _REGISTERED[name] = True
-        logger.info("Registered CUDA kernel '%s'", name)
-        return True
-    except Exception as e:
-        logger.error("Failed to register CUDA kernel '%s': %s", name, e)
-        _REGISTERED[name] = False
-        return False
+        so_path = _shared_library_path(so_name)
+        try:
+            lib = ctypes.cdll.LoadLibrary(str(so_path))
+            jax.ffi.register_ffi_target(
+                name,
+                jax.ffi.pycapsule(getattr(lib, symbol)),
+                platform="CUDA",
+                api_version=1,
+            )
+            _REGISTERED[name] = True
+            logger.info("Registered CUDA kernel '%s'", name)
+            return True
+        except Exception as e:
+            logger.error("Failed to register CUDA kernel '%s': %s", name, e)
+            _REGISTERED[name] = False
+            return False
 
 
 def _register_scatter():
