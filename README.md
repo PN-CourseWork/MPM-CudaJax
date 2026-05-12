@@ -10,6 +10,52 @@ faster than the JAX baseline** at 200K–5M particles on an RTX 3080, and
 clears the JAX OOM ceiling — the JAX path runs out at ~5M particles on
 10 GB, cuda_v2 keeps going past 10M.
 
+## Quickstart
+
+You need [uv](https://docs.astral.sh/uv/). Everything else (Python, JAX,
+CUDA toolkit deps) is pinned in `pyproject.toml` and managed by uv — do
+**not** run `pip install` directly.
+
+```bash
+git clone git@github.com:philipnickel/MPM-CudaJax.git
+cd MPM-CudaJax
+```
+
+**No GPU?** Install the CPU build and run a short simulation:
+```bash
+uv sync --extra jax
+uv run --extra jax python simulate.py sim.num_frames=20
+```
+A jelly cube falls onto a sticky floor and renders to
+`output/jelly_jax.gif`. With `sim.num_frames=20` it takes a few seconds.
+
+**Have an NVIDIA GPU?** Install with the CUDA extra (this also builds
+the custom CUDA kernels via CMake — needs `nvcc` on `PATH`):
+```bash
+uv sync --extra jax-cuda
+uv run --extra jax-cuda python simulate.py kernel=cuda_v2 timing_mode=per_stage
+```
+
+To benchmark instead of rendering:
+```bash
+uv run --extra jax-cuda python simulate.py \
+    kernel=cuda_v2 timing_mode=per_stage \
+    sim.n_particles=500000 sim.num_grids=64 sim.num_frames=15 \
+    benchmark=true
+```
+Prints `total_steps`, `elapsed_s`, `steps_per_sec`, and average
+`ms/step`. No GIF, no per-frame state capture — just wall-clock timing.
+
+Outputs:
+- GIF renders → `output/<tag>_<kernel>.gif`
+- Hydra logs / config snapshots → `outputs/<date>/<run>/`
+- Multirun sweep results → `multirun/<date>/<run>/`
+- Built CUDA `.so` files → `mpm_jax/cuda/_lib/` (rebuilds on `.cu` edit via `editable.rebuild=true`)
+- wandb logs (online by default; set `WANDB_MODE=disabled` for offline)
+
+If you want a guided tour of the kernel variants and what each one does,
+see [Kernel variants](#kernel-variants) below.
+
 ## Setup
 
 Requires [uv](https://docs.astral.sh/uv/).
