@@ -198,6 +198,12 @@ def run_jax(cfg: DictConfig):
         # stencil-node targets, so `__match_any_sync` collapses 4-8x of the
         # atomics into one. Tradeoff: an argsort per substep (O(N log N)).
         print("Using CUDA inline P2G kernel with Morton sort + warp shuffle (cuda_v3_inline)")
+    elif kernel_name == 'cuda_v4_inline':
+        # cuda_v4_inline: cell-major scheduling + 4^3 shared-memory tile +
+        # inline weights. JAX sorts particles by home cell every substep and
+        # passes (sorted x, v, C, stress, cell_start) to one CUDA launch.
+        # Per-frame only (the sort + ffi call live inside lax.scan).
+        print("Using CUDA cell-major + smem-tile inline P2G kernel (cuda_v4_inline)")
     elif kernel_name == 'jax_v1_5':
         # Pure JAX, but the (N, 27, *) momentum/mass intermediate is replaced
         # by a lax.scan over the 27 stencil offsets. Per-stage only — the
@@ -259,16 +265,23 @@ def run_jax(cfg: DictConfig):
             "(by design — the whole frame compiles to one XLA program). "
             "Run with timing_mode=per_frame."
         )
+    if kernel_name == 'cuda_v2_inline' and timing_mode == 'per_stage':
+        raise RuntimeError(
+            "kernel=cuda_v2_inline is only wired into the per-frame path "
+            "(by design — the whole frame compiles to one XLA program). "
+            "Run with timing_mode=per_frame."
+        )
+
     if kernel_name == 'cuda_v3_inline' and timing_mode == 'per_stage':
         raise RuntimeError(
             "kernel=cuda_v3_inline is only wired into the per-frame path. "
             "Run with timing_mode=per_frame."
         )
 
-    if kernel_name == 'cuda_v2_inline' and timing_mode == 'per_stage':
+    if kernel_name == 'cuda_v4_inline' and timing_mode == 'per_stage':
         raise RuntimeError(
-            "kernel=cuda_v2_inline is only wired into the per-frame path "
-            "(by design — the whole frame compiles to one XLA program). "
+            "kernel=cuda_v4_inline is only wired into the per-frame path "
+            "(the JAX-side sort and FFI call both live inside lax.scan). "
             "Run with timing_mode=per_frame."
         )
 
@@ -307,6 +320,18 @@ def run_jax(cfg: DictConfig):
         elif kernel_name == 'cuda_v3_inline':
             from mpm_jax.cuda.p2g_cuda import build_jit_frame_v3_inline
             jit_frame = build_jit_frame_v3_inline(
+                params, elasticity_fn, plasticity_fn,
+                pre_fn, post_fn, sim.steps_per_frame)
+
+            def run_frame(s):
+                return jit_frame(s)
+
+            state = make_state()
+            state = jit_frame(state); jax.block_until_ready(state.x)
+            _warmup_metrics(state)
+        elif kernel_name == 'cuda_v4_inline':
+            from mpm_jax.cuda.p2g_cuda import build_jit_frame_v4_inline
+            jit_frame = build_jit_frame_v4_inline(
                 params, elasticity_fn, plasticity_fn,
                 pre_fn, post_fn, sim.steps_per_frame)
 
