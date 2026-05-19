@@ -87,6 +87,10 @@ def _register_inline():
     return _register("p2g_inline_cuda", "libp2g_inline.so", "P2GInline")
 
 
+def _register_v2_inline():
+    return _register("p2g_v2_inline_cuda", "libp2g_v2_inline.so", "P2GV2Inline")
+
+
 def cuda_p2g_scatter(mv, m, index, num_grids):
     """CUDA P2G scatter via JAX FFI.
 
@@ -210,6 +214,8 @@ def is_available(kernel='scatter'):
         return _register_g2p_fused()
     elif kernel == 'inline':
         return _register_inline()
+    elif kernel == 'v2_inline':
+        return _register_v2_inline()
     return False
 
 
@@ -308,6 +314,105 @@ def build_jit_frame_inline(params, elasticity_fn, plasticity_fn,
                 )
             else:
                 # JAX G2P (materialises (N, 27, *) weights for the gather).
+                weight, dweight, dpos, index = compute_weights_and_indices(
+                    x, params.inv_dx, params.dx, params.num_grids)
+                new_x, new_v, new_C, new_F = g2p(
+                    grid_v, weight, dweight, dpos, index,
+                    state.F, x, params.dt, params.inv_dx, params.clip_bound)
+
+            new_F = plasticity_fn(new_F)
+            return MPMState(x=new_x, v=new_v, C=new_C, F=new_F), None
+
+        state, _ = jax.lax.scan(scan_body, state, None, length=steps_per_frame)
+        return state
+
+    return jit_frame
+
+
+def cuda_p2g_v2_inline(x, v, C, stress, num_grids, dt, vol, p_mass, inv_dx, dx):
+    """Inline-scatter CUDA P2G with warp-shuffle reduction (cuda_v2_inline).
+
+    Same FFI signature as ``cuda_p2g_inline`` — only the C++ symbol is
+    different. The kernel inserts a ``__match_any_sync`` + ``__shfl_xor_sync``
+    warp reduction in front of every atomicAdd inside the 27-stencil scatter
+    loop, so warp-resident contributions to the same grid_idx collapse to a
+    single atomic.
+    """
+    N = x.shape[0]
+    G = num_grids
+    G3 = G ** 3
+    C_flat = C.reshape(N, 9)
+    stress_flat = stress.reshape(N, 9)
+
+    grid_mv, grid_m = jax.ffi.ffi_call(
+        "p2g_v2_inline_cuda",
+        (
+            jax.ShapeDtypeStruct((G3, 3), jnp.float32),
+            jax.ShapeDtypeStruct((G3,), jnp.float32),
+        ),
+        vmap_method="broadcast_all",
+    )(
+        x, v, C_flat, stress_flat,
+        N=np.int32(N),
+        G=np.int32(G),
+        dt=np.float32(dt),
+        vol=np.float32(vol),
+        p_mass=np.float32(p_mass),
+        inv_dx=np.float32(inv_dx),
+        dx=np.float32(dx),
+    )
+
+    return grid_mv, grid_m
+
+
+def build_jit_frame_v2_inline(params, elasticity_fn, plasticity_fn,
+                              pre_particle_fn, post_grid_fn, steps_per_frame,
+                              use_cuda_g2p=True):
+    """Per-frame JIT'd function using the cuda_v2_inline P2G kernel.
+
+    Identical structure to ``build_jit_frame_inline``; only the P2G FFI call
+    is swapped for the warp-reduction variant. G2P still uses the fused CUDA
+    kernel (``cuda_g2p_fused``) when ``use_cuda_g2p=True``.
+    """
+    if not is_available('v2_inline'):
+        raise RuntimeError(
+            "cuda_v2_inline P2G kernel not registered (missing .so?). "
+            "Run `pixi install -e gpu` to build.")
+
+    if use_cuda_g2p and not is_available('g2p_fused'):
+        raise RuntimeError(
+            "cuda g2p kernel not registered (missing .so?). "
+            "Run `pixi install -e gpu` to build, or pass "
+            "use_cuda_g2p=False to fall back to the JAX G2P.")
+
+    from mpm_jax.solver import (
+        MPMState,
+        compute_weights_and_indices,
+        g2p,
+        grid_update as grid_update_fn,
+    )
+
+    @jax.jit
+    def jit_frame(state):
+        def scan_body(state, _):
+            x, v = pre_particle_fn(state.x, state.v, 0.0)
+            stress = elasticity_fn(state.F)
+            grid_mv, grid_m = cuda_p2g_v2_inline(
+                x, v, state.C, stress,
+                params.num_grids, params.dt, params.vol, params.p_mass,
+                params.inv_dx, params.dx,
+            )
+            grid_mv = grid_update_fn(
+                grid_mv, grid_m, params.gravity, params.dt, params.damping)
+            grid_v = post_grid_fn(grid_mv, grid_m, 0.0)
+
+            if use_cuda_g2p:
+                new_x, new_v, new_C, new_F = cuda_g2p_fused(
+                    x, state.F, grid_v,
+                    params.num_grids, params.dt,
+                    params.inv_dx, params.dx, params.clip_bound,
+                )
+            else:
                 weight, dweight, dpos, index = compute_weights_and_indices(
                     x, params.inv_dx, params.dx, params.num_grids)
                 new_x, new_v, new_C, new_F = g2p(
