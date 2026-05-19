@@ -5,26 +5,40 @@
 //     B-spline weights + 27-stencil scatter computed in registers. No
 //     (N, 27, *) tensor is ever materialised in HBM.
 //   * `p2g_scatter_smem.cu` (cuda_v4): particles are sorted by their home
-//     cell on the JAX side; one CUDA block per grid cell aggregates its
-//     particles' contributions into a 4x4x4 shared-memory tile via fast
+//     SUPER-cell on the JAX side; one CUDA block per super-cell aggregates
+//     its particles' contributions into a 4x4x4 shared-memory tile via fast
 //     shmem atomics, then flushes the tile to global memory with one
 //     atomicAdd per node.
 //
+// Super-cells (Approach B from the v4 fix plan):
+//   A super-cell of size SC^3 grid cells. One CUDA block per super-cell.
+//   At G=64 with SC=2, grid = (32)^3 = 32K blocks instead of 262K,
+//   which is 8x fewer launch / scheduler dispatches and 8x fewer
+//   per-block fixed costs (tile zero, syncs, flush).
+//
+// With SC=2:
+//   Each super-cell covers cells (Cx*2, Cx*2+1) x (similar y, z) = 8 cells.
+//   Each cell's quadratic stencil is 3^3, so the union of stencils for the
+//   8 cells in the super-cell spans (Cx*2 - 1 .. Cx*2 + 2) per axis = 4
+//   nodes, i.e. exactly the same 4^3 = 64-node smem tile as the SC=1
+//   version. So the tile size doesn't grow and we still flush only 64
+//   atomicAdds per block — but we've amortised the empty-block + setup
+//   overhead across 8x as many particles.
+//
 // The hypothesis is that the smem aggregation amortises the 27 global
 // atomicAdds per particle (108 floats) down to ~64 global atomicAdds per
-// occupied cell, regardless of how many particles live in the cell.
-// `cuda_v4` already did this for the scatter-only path, but its inputs
-// were the (N, 27, *) momentum/mass/index tensors precomputed by JAX —
-// which cost more than the smem aggregation saved. With inline weight
-// computation those tensors disappear from HBM and only x/v/C/stress are
-// loaded once per particle.
+// super-cell. `cuda_v4` already did this for the scatter-only path with
+// 1 block per cell, but its inputs were the (N, 27, *) momentum/mass/index
+// tensors precomputed by JAX — which cost more than the smem aggregation
+// saved. With inline weight computation those tensors disappear from HBM
+// and only x/v/C/stress are loaded once per particle.
 //
 // Inputs (all float32 unless noted):
-//   x:          (N, 3)        particle positions (SORTED by home cell)
+//   x:          (N, 3)        particle positions (SORTED by home super-cell)
 //   v:          (N, 3)        particle velocities
 //   C:          (N, 9)        APIC affine matrix (row-major)
 //   stress:     (N, 9)        Kirchhoff stress (row-major)
-//   cell_start: (G^3 + 1,) int32  CSR boundaries into the sorted arrays
+//   cell_start: ((G/SC)^3 + 1,) int32  CSR boundaries into the sorted arrays
 //
 // Outputs:
 //   grid_mv: (G^3, 3)
@@ -32,22 +46,20 @@
 //
 // Scalar attributes: dt, vol, p_mass, inv_dx, dx
 //
-// Home cell convention (matches `cuda_p2g_scatter_smem` Python wrapper):
+// Home cell convention (matches `_home_cell_id` in the Python wrapper):
 //   For a particle at x, the stencil base node is
 //     base = floor(x * inv_dx - 0.5)
 //   and the center stencil node (offset (1,1,1)) is
 //     home = base + 1
-//   So home in [0, G). Sorting by `home` puts every particle whose center
-//   stencil node is the same cell together, and the 27 stencil indices for
-//   any such particle are home + (-1..+1, -1..+1, -1..+1) — a 3^3 box
-//   contained entirely in the 4x4x4 tile centred at (home-1).
+//   home in [0, G). Super-cell id is (home / SC) collapsed to flat.
 
 #include "xla/ffi/api/ffi.h"
 
-#define TILE_DIM 4
-#define TILE_SIZE (TILE_DIM * TILE_DIM * TILE_DIM)  // 64 nodes
+#define SC 2                                   // super-cell width (in cells)
+#define TILE_DIM (SC + 2)                      // stencil-union half = 1 on each side
+#define TILE_SIZE (TILE_DIM * TILE_DIM * TILE_DIM)  // 64 nodes for SC=2
 #define STENCIL 27
-#define BLOCK_SIZE 128  // threads per cell-block
+#define BLOCK_SIZE 128  // threads per super-cell block
 
 namespace ffi = xla::ffi;
 
@@ -76,34 +88,49 @@ __global__ void zero_kernel(float* __restrict__ buf, int n) {
 // memory with one atomicAdd per (mv, m).
 
 __global__ void p2g_v4_inline_kernel(
-    const float* __restrict__ x,          // (N, 3) sorted
+    const float* __restrict__ x,          // (N, 3) sorted by home super-cell
     const float* __restrict__ v,          // (N, 3) sorted
     const float* __restrict__ C,          // (N, 9) sorted, row-major
     const float* __restrict__ stress,     // (N, 9) sorted, row-major
-    const int*   __restrict__ cell_start, // (G^3 + 1,)
+    const int*   __restrict__ cell_start, // ((G/SC)^3 + 1,)
     float*       __restrict__ grid_mv,    // (G^3, 3)
     float*       __restrict__ grid_m,     // (G^3,)
     int G,
     float dt, float vol, float p_mass, float inv_dx, float dx
 ) {
-    int cell_id = blockIdx.x;
-    int G3 = G * G * G;
-    if (cell_id >= G3) return;
+    int Gs = G / SC;                       // super-grid resolution
+    int Gs3 = Gs * Gs * Gs;
+    int super_id = blockIdx.x;
+    if (super_id >= Gs3) return;
 
-    int p_start = cell_start[cell_id];
-    int p_end   = cell_start[cell_id + 1];
+    int p_start = cell_start[super_id];
+    int p_end   = cell_start[super_id + 1];
     int n_particles = p_end - p_start;
 
-    // Cell 3D coords from flat index (matches the searchsorted CSR build).
-    int ci = cell_id / (G * G);
-    int cj = (cell_id / G) % G;
-    int ck = cell_id % G;
+    // Fast empty-super-cell exit. The jelly cube only occupies a fraction
+    // of the domain so most super-cells are empty. The exit must come
+    // *before* any shared-memory allocation or __syncthreads() — all
+    // threads in a block see the same super_id, so this return is
+    // uniform and no thread is left hanging on a barrier.
+    if (n_particles == 0) return;
 
-    // Tile origin: (home - 1) so that the 3^3 stencil of any home-centred
-    // particle lands at tile-local indices (0..2). The 4th slot is slack.
-    int tile_i = ci - 1;
-    int tile_j = cj - 1;
-    int tile_k = ck - 1;
+    // Super-cell 3D coords from flat index (matches the JAX-side super-cell id).
+    int Si = super_id / (Gs * Gs);
+    int Sj = (super_id / Gs) % Gs;
+    int Sk = super_id % Gs;
+
+    // Base cell of the super-cell (in cells, not super-cells).
+    int base_ci = Si * SC;
+    int base_cj = Sj * SC;
+    int base_ck = Sk * SC;
+
+    // Tile origin: (base_cell - 1) so that the union of 3^3 stencils for
+    // particles in any of this super-cell's SC^3 cells lands at tile-local
+    // indices 0..TILE_DIM-1. For SC=2 this gives tile_dim=4, spanning
+    // cells (base_cell - 1) .. (base_cell + 2).
+    int tile_i = base_ci - 1;
+    int tile_j = base_cj - 1;
+    int tile_k = base_ck - 1;
 
     // Shared-memory tile: 64 nodes, each (mv_x, mv_y, mv_z, mass).
     // 256 floats = 1 KB. Fits even on tiny chips.
@@ -113,10 +140,6 @@ __global__ void p2g_v4_inline_kernel(
     for (int t = threadIdx.x; t < TILE_SIZE * 4; t += blockDim.x)
         tile[t] = 0.0f;
     __syncthreads();
-
-    // If the cell is empty, skip straight to the flush — but everyone has to
-    // hit the same __syncthreads() so we can't early-return here. We just
-    // let the per-particle loop be a no-op.
 
     // ---- Per-particle inline scatter into the tile ----
     for (int p = threadIdx.x; p < n_particles; p += blockDim.x) {
@@ -263,18 +286,24 @@ ffi::Error P2GV4InlineImpl(
     ffi::Buffer<ffi::S32> cell_start,
     ffi::ResultBuffer<ffi::F32> grid_mv,
     ffi::ResultBuffer<ffi::F32> grid_m,
+    int32_t G,
     float dt, float vol, float p_mass, float inv_dx, float dx
 ) {
-    // cell_start is (G^3 + 1,) ints.
-    int G3_plus_1 = static_cast<int>(cell_start.dimensions()[0]);
-    int G3 = G3_plus_1 - 1;
-    int G = 1;
-    while (G * G * G < G3) G++;
-    if (G * G * G != G3) {
+    // cell_start is ((G/SC)^3 + 1,) ints.
+    int Gs = G / SC;
+    int Gs3 = Gs * Gs * Gs;
+    int expected = Gs3 + 1;
+    int got = static_cast<int>(cell_start.dimensions()[0]);
+    if (got != expected) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                          "cell_start size is not G^3 + 1 for integer G");
+                          "cell_start size does not match (G/SC)^3 + 1");
+    }
+    if (G % SC != 0) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "G must be divisible by SC (super-cell width)");
     }
 
+    int G3 = G * G * G;
     int grid_mv_size = G3 * 3;
     int grid_m_size = G3;
 
@@ -283,8 +312,8 @@ ffi::Error P2GV4InlineImpl(
     zero_kernel<<<zero_blocks, 256, 0, stream>>>(grid_mv->typed_data(), grid_mv_size);
     zero_kernel<<<(grid_m_size + 255) / 256, 256, 0, stream>>>(grid_m->typed_data(), grid_m_size);
 
-    // One block per cell.
-    p2g_v4_inline_kernel<<<G3, BLOCK_SIZE, 0, stream>>>(
+    // One block per super-cell.
+    p2g_v4_inline_kernel<<<Gs3, BLOCK_SIZE, 0, stream>>>(
         x.typed_data(),
         v.typed_data(),
         C.typed_data(),
@@ -310,9 +339,10 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::F32>>()   // v (sorted)
         .Arg<ffi::Buffer<ffi::F32>>()   // C (sorted)
         .Arg<ffi::Buffer<ffi::F32>>()   // stress (sorted)
-        .Arg<ffi::Buffer<ffi::S32>>()   // cell_start
+        .Arg<ffi::Buffer<ffi::S32>>()   // cell_start over super-cells
         .Ret<ffi::Buffer<ffi::F32>>()   // grid_mv
         .Ret<ffi::Buffer<ffi::F32>>()   // grid_m
+        .Attr<int32_t>("G")
         .Attr<float>("dt")
         .Attr<float>("vol")
         .Attr<float>("p_mass")
