@@ -126,7 +126,33 @@ class StageTimer:
 # Backend-specific runners
 # ---------------------------------------------------------------------------
 
+def _maybe_enable_cuda_graphs(kernel_name):
+    """Toggle XLA command-buffer capture (= CUDA Graphs) for the v6 kernel.
+
+    Must be called BEFORE the first `import jax`, otherwise XLA has already
+    parsed XLA_FLAGS and the new value is ignored. Routed from run_jax() at
+    its very top, and (defensively) from main() before any jax import.
+
+    Project plan v6: capture the repeating P2G -> grid_update -> G2P substep
+    as a CUDA Graph and replay it. Concretely we ask XLA to wrap FUSION,
+    CUSTOM_CALL (our FFI scatter / fused G2P) and WHILE (the lax.scan
+    substep loop) into command buffers, which the GPU runtime executes as
+    a single replayed graph per substep.
+    """
+    if kernel_name != 'cuda_v6_inline':
+        return
+    extra = "--xla_gpu_enable_command_buffer=FUSION,CUSTOM_CALL,WHILE"
+    cur = os.environ.get("XLA_FLAGS", "")
+    if extra not in cur:
+        os.environ["XLA_FLAGS"] = (cur + " " + extra).strip()
+        print(f"cuda_v6_inline: enabling XLA CUDA Graph capture via XLA_FLAGS={os.environ['XLA_FLAGS']}")
+
+
 def run_jax(cfg: DictConfig):
+    # Must come BEFORE `import jax` — XLA reads XLA_FLAGS once at startup.
+    kernel_name = cfg.get('kernel', {}).get('name', 'jax')
+    _maybe_enable_cuda_graphs(kernel_name)
+
     import jax
     import jax.numpy as jnp
     from mpm_jax.solver import (
@@ -138,7 +164,6 @@ def run_jax(cfg: DictConfig):
     sim = cfg.sim
     mat = cfg.material
     bench = cfg.get('benchmark', False)
-    kernel_name = cfg.get('kernel', {}).get('name', 'jax')
 
     # Build p2g_fn based on kernel config. cuda_fused does its own thing
     # because the kernel covers stress + plasticity + scatter and doesn't fit
@@ -198,6 +223,14 @@ def run_jax(cfg: DictConfig):
         # stencil-node targets, so `__match_any_sync` collapses 4-8x of the
         # atomics into one. Tradeoff: an argsort per substep (O(N log N)).
         print("Using CUDA inline P2G kernel with Morton sort + warp shuffle (cuda_v3_inline)")
+    elif kernel_name == 'cuda_v6_inline':
+        # cuda_v6_inline: exactly the cuda_v3_inline pipeline (Morton sort +
+        # warp-shuffle inline scatter + fused G2P), but with XLA's command
+        # buffer / CUDA Graph capture enabled via XLA_FLAGS. The substep
+        # body (FUSION + CUSTOM_CALL + WHILE) is wrapped into a CUDA Graph
+        # and replayed each substep, eliminating most of the per-kernel
+        # launch dispatch overhead. Project plan v6 (L4: Streams & Graphs).
+        print("Using cuda_v3_inline pipeline replayed through XLA CUDA Graph capture (cuda_v6_inline)")
     elif kernel_name == 'cuda_v4_inline':
         # cuda_v4_inline: cell-major scheduling + 4^3 shared-memory tile +
         # inline weights. JAX sorts particles by home cell every substep and
@@ -277,6 +310,12 @@ def run_jax(cfg: DictConfig):
             "kernel=cuda_v3_inline is only wired into the per-frame path. "
             "Run with timing_mode=per_frame."
         )
+    if kernel_name == 'cuda_v6_inline' and timing_mode == 'per_stage':
+        raise RuntimeError(
+            "kernel=cuda_v6_inline is only wired into the per-frame path "
+            "(CUDA Graph capture wraps the lax.scan substep loop). "
+            "Run with timing_mode=per_frame."
+        )
 
     if kernel_name == 'cuda_v4_inline' and timing_mode == 'per_stage':
         raise RuntimeError(
@@ -318,6 +357,20 @@ def run_jax(cfg: DictConfig):
             state = jit_frame(state); jax.block_until_ready(state.x)
             _warmup_metrics(state)
         elif kernel_name == 'cuda_v3_inline':
+            from mpm_jax.cuda.p2g_cuda import build_jit_frame_v3_inline
+            jit_frame = build_jit_frame_v3_inline(
+                params, elasticity_fn, plasticity_fn,
+                pre_fn, post_fn, sim.steps_per_frame)
+
+            def run_frame(s):
+                return jit_frame(s)
+
+            state = make_state()
+            state = jit_frame(state); jax.block_until_ready(state.x)
+            _warmup_metrics(state)
+        elif kernel_name == 'cuda_v6_inline':
+            # Same compute path as cuda_v3_inline; the CUDA-Graph capture
+            # comes from XLA_FLAGS set in _maybe_enable_cuda_graphs() above.
             from mpm_jax.cuda.p2g_cuda import build_jit_frame_v3_inline
             jit_frame = build_jit_frame_v3_inline(
                 params, elasticity_fn, plasticity_fn,
@@ -779,6 +832,10 @@ def main(cfg: DictConfig):
     kernel_name = cfg.get('kernel', {}).get('name', 'jax')
     N = cfg.sim.n_particles
     G = cfg.sim.num_grids
+
+    # CUDA Graphs toggle (v6) must happen before any `import jax` in this
+    # process — including the profile=jax branch a few lines down.
+    _maybe_enable_cuda_graphs(kernel_name)
 
     # Init wandb
     wandb_cfg = OmegaConf.to_container(cfg, resolve=True)

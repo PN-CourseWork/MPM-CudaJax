@@ -1,0 +1,23 @@
+# cuda_v6_inline — cuda_v3_inline (Morton sort + warp-shuffle inline scatter)
+# replayed through XLA's CUDA Graph capture (via command buffers).
+#
+# Project plan v6 — "CUDA Graphs (L4: Streams & Graphs)". The repeating
+# P2G -> grid update -> G2P substep is captured as a CUDA Graph and replayed
+# with minimal launch overhead.
+#
+# Implementation strategy: rather than reimplement the substep body in raw
+# CUDA with cudaStreamBeginCapture / cudaGraphLaunch, we lean on the
+# command-buffer support that JAX/XLA already ships. Setting
+# XLA_FLAGS=--xla_gpu_enable_command_buffer=FUSION,CUSTOM_CALL,WHILE before
+# `import jax` lets XLA wrap fusions, custom calls (our FFI scatter +
+# fused G2P), and the lax.scan WHILE loop into a single CUDA Graph that
+# replays per substep. The actual compute path is identical to
+# cuda_v3_inline; only the launch mechanism changes.
+#
+# Hypothesis: launch dispatch dominates at small/medium N (10K-200K),
+# where per-substep work is on the order of 1 ms and the ~5-20 µs of
+# per-launch overhead per ~8 kernels matters; at N >= 1M the substep is
+# limited by actual work and v6 should tie cuda_v3_inline.
+#
+# Pair with material=jelly_jacobi. Wired into the per-frame path only.
+name: cuda_v6_inline
