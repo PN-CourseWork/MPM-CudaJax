@@ -412,17 +412,29 @@ def cuda_p2g_v3_inline(x, v, C, stress, num_grids, dt, vol, p_mass, inv_dx, dx):
     return grid_mv, grid_m
 
 
+# Super-cell width used by cuda_v4_inline. Must match the SC #define in
+# mpm_jax/cuda/kernels/p2g_v4_inline.cu. With SC=k the kernel launches
+# (G/SC)^3 blocks instead of G^3 (k^3 fewer) and each block aggregates
+# particles from SC^3 cells into a (SC+2)^3 smem tile. SC=2 is the sweet
+# spot at G=64 — the tile stays at 4^3=64 nodes (no extra flush cost) but
+# the block count drops 8x. Empirically SC=4 makes the tile too big
+# (216 nodes) and the per-block flush dominates.
+V4_SUPER_CELL_WIDTH = 2
+
+
 def cuda_p2g_v4_inline(x_sorted, v_sorted, C_sorted, stress_sorted, cell_start,
                        num_grids, dt, vol, p_mass, inv_dx, dx):
     """Cell-major inline P2G via JAX FFI (cuda_v4_inline).
 
-    The Python wrapper assumes the inputs are already sorted by home cell
-    (i.e. ``floor(x*inv_dx - 0.5) + 1`` collapsed to a flat G^3 index) and
-    that ``cell_start`` is the CSR boundary array of length G^3 + 1.
+    The Python wrapper assumes the inputs are already sorted by home
+    *super*-cell and that ``cell_start`` is the CSR boundary array of length
+    (G/SC)^3 + 1, where SC is :data:`V4_SUPER_CELL_WIDTH`.
 
-    The kernel uses one CUDA block per grid cell and aggregates each cell's
-    contributions into a 4x4x4 shared-memory tile before flushing to HBM.
-    Drops the (N, 27, *) materialisation of ``cuda_v4``.
+    The kernel uses one CUDA block per super-cell and aggregates each
+    super-cell's contributions into a 4x4x4 shared-memory tile before
+    flushing to HBM. The super-cell coarsening (SC=2) cuts the block count
+    by 8x vs the old SC=1 cell-major variant — most of those blocks were
+    empty since the jelly cube only occupies ~31K of 262K cells at G=64.
     """
     N = x_sorted.shape[0]
     G = num_grids
@@ -439,6 +451,7 @@ def cuda_p2g_v4_inline(x_sorted, v_sorted, C_sorted, stress_sorted, cell_start,
         vmap_method="broadcast_all",
     )(
         x_sorted, v_sorted, C_flat, stress_flat, cell_start,
+        G=np.int32(G),
         dt=np.float32(dt),
         vol=np.float32(vol),
         p_mass=np.float32(p_mass),
@@ -459,6 +472,25 @@ def _home_cell_id(x, inv_dx, G):
     home = base + 1
     home = jnp.clip(home, 0, G - 1)
     flat = home[:, 0] * (G * G) + home[:, 1] * G + home[:, 2]
+    return flat.astype(jnp.int32)
+
+
+def _home_super_cell_id(x, inv_dx, G, sc=V4_SUPER_CELL_WIDTH):
+    """Home super-cell id for the v4_inline cell-major sort.
+
+    A super-cell covers ``sc^3`` grid cells. The sort key is the super-cell
+    that contains the particle's home cell. Used by build_jit_frame_v4_inline
+    to feed the kernel a CSR layout indexed by super-cell.
+    """
+    px = x * inv_dx
+    base = jnp.floor(px - 0.5).astype(jnp.int32)
+    home = base + 1
+    home = jnp.clip(home, 0, G - 1)
+    Gs = G // sc
+    si = home[:, 0] // sc
+    sj = home[:, 1] // sc
+    sk = home[:, 2] // sc
+    flat = si * (Gs * Gs) + sj * Gs + sk
     return flat.astype(jnp.int32)
 
 
@@ -616,8 +648,15 @@ def build_jit_frame_v4_inline(params, elasticity_fn, plasticity_fn,
             "use_cuda_g2p=False to fall back to the JAX G2P.")
 
     G = params.num_grids
-    G3 = G ** 3
-    cell_boundaries = jnp.arange(G3 + 1, dtype=jnp.int32)
+    sc = V4_SUPER_CELL_WIDTH
+    if G % sc != 0:
+        raise RuntimeError(
+            f"cuda_v4_inline requires num_grids ({G}) divisible by "
+            f"super-cell width ({sc})."
+        )
+    Gs = G // sc
+    Gs3 = Gs ** 3
+    super_boundaries = jnp.arange(Gs3 + 1, dtype=jnp.int32)
 
     from mpm_jax.solver import (
         MPMState,
@@ -632,8 +671,8 @@ def build_jit_frame_v4_inline(params, elasticity_fn, plasticity_fn,
             x, v = pre_particle_fn(state.x, state.v, 0.0)
             stress = elasticity_fn(state.F)
 
-            cell_id = _home_cell_id(x, params.inv_dx, G)
-            order = jnp.argsort(cell_id)
+            super_id = _home_super_cell_id(x, params.inv_dx, G, sc)
+            order = jnp.argsort(super_id)
 
             x_s = x[order]
             v_s = v[order]
@@ -641,9 +680,9 @@ def build_jit_frame_v4_inline(params, elasticity_fn, plasticity_fn,
             stress_s = stress[order]
             F_s = state.F[order]
 
-            cell_id_sorted = cell_id[order]
+            super_id_sorted = super_id[order]
             cell_start = jnp.searchsorted(
-                cell_id_sorted, cell_boundaries
+                super_id_sorted, super_boundaries
             ).astype(jnp.int32)
 
             grid_mv, grid_m = cuda_p2g_v4_inline(
