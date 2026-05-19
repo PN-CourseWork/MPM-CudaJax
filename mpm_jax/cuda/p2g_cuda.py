@@ -251,22 +251,31 @@ def cuda_p2g_inline(x, v, C, stress, num_grids, dt, vol, p_mass, inv_dx, dx):
 
 
 def build_jit_frame_inline(params, elasticity_fn, plasticity_fn,
-                           pre_particle_fn, post_grid_fn, steps_per_frame):
+                           pre_particle_fn, post_grid_fn, steps_per_frame,
+                           use_cuda_g2p=True):
     """Per-frame JIT'd function using the cuda_v1_inline P2G kernel.
 
-    Mirrors ``solver.build_jit_frame`` but the substep body routes P2G
-    through one CUDA kernel call that does weights + per-stencil momentum
-    + atomic scatter inline per particle. The ``(N, 27, *)`` momentum
-    tensor never materialises in HBM.
+    Mirrors ``solver.build_jit_frame`` but routes P2G through one CUDA
+    kernel call (inline weights + 27-stencil atomic scatter per particle,
+    no ``(N, 27, *)`` momentum tensor in HBM). When ``use_cuda_g2p=True``
+    (the default), the G2P gather also uses a CUDA kernel
+    (``g2p_fused.cu``) so the ``(N, 27, *)`` weight/dweight/dpos/index
+    tensors don't materialise on the G2P side either.
 
     Result is one ``@jax.jit`` + ``lax.scan`` over ``steps_per_frame`` —
-    a single XLA program per frame, just like the pure-JAX ``build_jit_frame``.
-    Stress and G2P stay in JAX; only the P2G scatter is replaced.
+    a single XLA program per frame. Stress and plasticity stay in JAX
+    (model-agnostic); only the two scatter/gather kernels are CUDA.
     """
     if not is_available('inline'):
         raise RuntimeError(
             "cuda_v1_inline P2G kernel not registered (missing .so?). "
             "Run `pixi install -e gpu` to build.")
+
+    if use_cuda_g2p and not is_available('g2p_fused'):
+        raise RuntimeError(
+            "cuda g2p kernel not registered (missing .so?). "
+            "Run `pixi install -e gpu` to build, or pass "
+            "use_cuda_g2p=False to fall back to the JAX G2P.")
 
     from mpm_jax.solver import (
         MPMState,
@@ -287,16 +296,24 @@ def build_jit_frame_inline(params, elasticity_fn, plasticity_fn,
             )
             grid_mv = grid_update_fn(
                 grid_mv, grid_m, params.gravity, params.dt, params.damping)
-            grid_mv = post_grid_fn(grid_mv, grid_m, 0.0)
-            # G2P needs weights — compute them here (after P2G), so the
-            # only (N, 27, *) tensors that exist are the ones G2P actually
-            # consumes (gather + grad_v). No materialisation between
-            # P2G compute and P2G scatter.
-            weight, dweight, dpos, index = compute_weights_and_indices(
-                x, params.inv_dx, params.dx, params.num_grids)
-            new_x, new_v, new_C, new_F = g2p(
-                grid_mv, weight, dweight, dpos, index,
-                state.F, x, params.dt, params.inv_dx, params.clip_bound)
+            grid_v = post_grid_fn(grid_mv, grid_m, 0.0)
+
+            if use_cuda_g2p:
+                # CUDA G2P: gather + grad_v + state update, register-resident
+                # 27-loop. No (N, 27, *) tensors anywhere in this substep.
+                new_x, new_v, new_C, new_F = cuda_g2p_fused(
+                    x, state.F, grid_v,
+                    params.num_grids, params.dt,
+                    params.inv_dx, params.dx, params.clip_bound,
+                )
+            else:
+                # JAX G2P (materialises (N, 27, *) weights for the gather).
+                weight, dweight, dpos, index = compute_weights_and_indices(
+                    x, params.inv_dx, params.dx, params.num_grids)
+                new_x, new_v, new_C, new_F = g2p(
+                    grid_v, weight, dweight, dpos, index,
+                    state.F, x, params.dt, params.inv_dx, params.clip_bound)
+
             new_F = plasticity_fn(new_F)
             return MPMState(x=new_x, v=new_v, C=new_C, F=new_F), None
 
