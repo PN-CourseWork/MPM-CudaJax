@@ -73,3 +73,15 @@ cuda = "12.0"
 [tool.pixi.environments]
 default = { features = ["cpu", "dev"], solve-group = "cpu" }
 gpu = { features = ["gpu", "dev"], solve-group = "gpu" }
+
+[tool.pixi.tasks]
+test = "pytest tests/ -v"
+lint = "ruff check ."
+clean = { cmd = "rm -f mpm_jax/cuda/_lib/*.so mpm_jax/cuda/kernels/*.so && rm -rf build multirun outputs output wandb && rm -f *.nsys-rep *.sqlite && find . -type d -name __pycache__ -exec rm -rf {} +" }
+
+[tool.pixi.feature.gpu.tasks]
+sim = "python simulate.py"
+sweep = "python simulate.py -cn sweep_baseline"
+sweep-quick = "python simulate.py -cn sweep_quick"
+sweep-all = "python simulate.py -cn sweep_all"
+rebuild-cuda = "pixi reinstall mpm-cudajax"
