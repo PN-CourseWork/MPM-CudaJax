@@ -185,6 +185,12 @@ def run_jax(cfg: DictConfig):
         # Jacobi SVD). Wired into the per-frame path: the FFI call lives
         # inside lax.scan so the whole frame compiles to one XLA program.
         print("Using CUDA inline P2G kernel (cuda_v1_inline) — JAX stress + register-resident scatter")
+    elif kernel_name == 'cuda_v2_inline':
+        # cuda_v2_inline: same as cuda_v1_inline but with warp-shuffle
+        # reduction (__match_any_sync + __shfl_xor_sync) folded into every
+        # atomicAdd inside the 27-stencil loop. Tests whether warp coalescing
+        # helps once the (N, 27, *) materialisation overhead is gone.
+        print("Using CUDA inline P2G kernel with warp shuffle (cuda_v2_inline)")
     elif kernel_name == 'jax_v1_5':
         # Pure JAX, but the (N, 27, *) momentum/mass intermediate is replaced
         # by a lax.scan over the 27 stencil offsets. Per-stage only — the
@@ -247,6 +253,13 @@ def run_jax(cfg: DictConfig):
             "Run with timing_mode=per_frame."
         )
 
+    if kernel_name == 'cuda_v2_inline' and timing_mode == 'per_stage':
+        raise RuntimeError(
+            "kernel=cuda_v2_inline is only wired into the per-frame path "
+            "(by design — the whole frame compiles to one XLA program). "
+            "Run with timing_mode=per_frame."
+        )
+
     def _warmup_metrics(s):
         """Compile the per-frame metric reads so the first timed frame doesn't
         eat a one-shot trace+compile on jnp.mean / jnp.abs.max."""
@@ -258,6 +271,18 @@ def run_jax(cfg: DictConfig):
         if kernel_name == 'cuda_v1_inline':
             from mpm_jax.cuda.p2g_cuda import build_jit_frame_inline
             jit_frame = build_jit_frame_inline(
+                params, elasticity_fn, plasticity_fn,
+                pre_fn, post_fn, sim.steps_per_frame)
+
+            def run_frame(s):
+                return jit_frame(s)
+
+            state = make_state()
+            state = jit_frame(state); jax.block_until_ready(state.x)
+            _warmup_metrics(state)
+        elif kernel_name == 'cuda_v2_inline':
+            from mpm_jax.cuda.p2g_cuda import build_jit_frame_v2_inline
+            jit_frame = build_jit_frame_v2_inline(
                 params, elasticity_fn, plasticity_fn,
                 pre_fn, post_fn, sim.steps_per_frame)
 

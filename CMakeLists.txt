@@ -38,7 +38,7 @@ message(STATUS "JAX FFI include: ${JAX_FFI_INCLUDE}")
 message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
 set(KERNEL_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/mpm_jax/cuda/kernels)
-set(KERNELS p2g_scatter p2g_scatter_warp p2g_scatter_smem p2g_fused p2g_inline g2p_fused)
+set(KERNELS p2g_scatter p2g_scatter_warp p2g_scatter_smem p2g_fused p2g_inline p2g_v2_inline g2p_fused)
 
 # Drop libs into mpm_jax/cuda/_lib/ in BOTH the source tree (for editable
 # installs, where p2g_cuda.py looks them up via Path(__file__).parent) and
