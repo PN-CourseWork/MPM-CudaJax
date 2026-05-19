@@ -178,6 +178,13 @@ def run_jax(cfg: DictConfig):
         # Implemented only on the per-stage path; per_frame would need a new
         # build_jit_frame_fused() that we don't have.
         print("Using CUDA fully fused P2G + G2P kernel — stress + scatter in one launch")
+    elif kernel_name == 'cuda_v1_inline':
+        # cuda_v1_inline: one CUDA kernel for inline-weights + 27-stencil
+        # atomic scatter, one thread per particle, register-resident loop.
+        # JAX does stress upstream (use material=jelly_jacobi for the fast
+        # Jacobi SVD). Wired into the per-frame path: the FFI call lives
+        # inside lax.scan so the whole frame compiles to one XLA program.
+        print("Using CUDA inline P2G kernel (cuda_v1_inline) — JAX stress + register-resident scatter")
     else:
         print("Using JAX P2G kernel")
 
@@ -223,6 +230,13 @@ def run_jax(cfg: DictConfig):
             "Run with timing_mode=per_stage."
         )
 
+    if kernel_name == 'cuda_v1_inline' and timing_mode == 'per_stage':
+        raise RuntimeError(
+            "kernel=cuda_v1_inline is only wired into the per-frame path "
+            "(by design — the whole frame compiles to one XLA program). "
+            "Run with timing_mode=per_frame."
+        )
+
     def _warmup_metrics(s):
         """Compile the per-frame metric reads so the first timed frame doesn't
         eat a one-shot trace+compile on jnp.mean / jnp.abs.max."""
@@ -231,20 +245,33 @@ def run_jax(cfg: DictConfig):
 
     # ---- Build the substep function for whichever timing_mode is selected ----
     if timing_mode == 'per_frame':
-        jit_step = build_jit_step(params, elasticity_fn, plasticity_fn,
-                                  pre_fn, post_fn, p2g_fn=p2g_fn)
-        jit_frame = build_jit_frame(params, elasticity_fn, plasticity_fn,
-                                    pre_fn, post_fn, sim.steps_per_frame, p2g_fn=p2g_fn)
+        if kernel_name == 'cuda_v1_inline':
+            from mpm_jax.cuda.p2g_cuda import build_jit_frame_inline
+            jit_frame = build_jit_frame_inline(
+                params, elasticity_fn, plasticity_fn,
+                pre_fn, post_fn, sim.steps_per_frame)
 
-        def run_frame(s):
-            return jit_frame(s)
+            def run_frame(s):
+                return jit_frame(s)
 
-        # Warmup: trace+compile everything we'll use in the timed region.
-        state = make_state()
-        state = jit_step(state); jax.block_until_ready(state.x)
-        state = make_state()
-        state = jit_frame(state); jax.block_until_ready(state.x)
-        _warmup_metrics(state)
+            state = make_state()
+            state = jit_frame(state); jax.block_until_ready(state.x)
+            _warmup_metrics(state)
+        else:
+            jit_step = build_jit_step(params, elasticity_fn, plasticity_fn,
+                                      pre_fn, post_fn, p2g_fn=p2g_fn)
+            jit_frame = build_jit_frame(params, elasticity_fn, plasticity_fn,
+                                        pre_fn, post_fn, sim.steps_per_frame, p2g_fn=p2g_fn)
+
+            def run_frame(s):
+                return jit_frame(s)
+
+            # Warmup: trace+compile everything we'll use in the timed region.
+            state = make_state()
+            state = jit_step(state); jax.block_until_ready(state.x)
+            state = make_state()
+            state = jit_frame(state); jax.block_until_ready(state.x)
+            _warmup_metrics(state)
     else:  # per_stage
         if kernel_name == 'cuda_fused':
             from mpm_jax.cuda.p2g_cuda import make_fused_stages
