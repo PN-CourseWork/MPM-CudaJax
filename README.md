@@ -12,33 +12,34 @@ clears the JAX OOM ceiling — the JAX path runs out at ~5M particles on
 
 ## Quickstart
 
-You need [uv](https://docs.astral.sh/uv/). Everything else (Python, JAX,
-CUDA toolkit deps) is pinned in `pyproject.toml` and managed by uv — do
-**not** run `pip install` directly.
+You need [pixi](https://pixi.sh/). Everything else (Python, JAX, CUDA
+toolkit deps) is pinned in `pyproject.toml` and `pixi.lock` and managed
+by pixi — do **not** run `pip install` directly.
 
 ```bash
 git clone git@github.com:philipnickel/MPM-CudaJax.git
 cd MPM-CudaJax
 ```
 
-**No GPU?** Install the CPU build and run a short simulation:
+**No GPU?** Install the default (CPU) env and run a short simulation:
 ```bash
-uv sync --extra jax
-uv run --extra jax python simulate.py sim.num_frames=20
+pixi install
+pixi run python simulate.py sim.num_frames=20
 ```
 A jelly cube falls onto a sticky floor and renders to
 `output/jelly_jax.gif`. With `sim.num_frames=20` it takes a few seconds.
 
-**Have an NVIDIA GPU?** Install with the CUDA extra (this also builds
-the custom CUDA kernels via CMake — needs `nvcc` on `PATH`):
+**Have an NVIDIA GPU (Linux)?** Install the `gpu` env (this also builds
+the custom CUDA kernels via CMake — `nvcc` and `gxx` ship from
+conda-forge inside the env, no system module load needed):
 ```bash
-uv sync --extra jax-cuda
-uv run --extra jax-cuda python simulate.py kernel=cuda_v2 timing_mode=per_stage
+pixi install -e gpu
+pixi run -e gpu python simulate.py kernel=cuda_v2 timing_mode=per_stage
 ```
 
 To benchmark instead of rendering:
 ```bash
-uv run --extra jax-cuda python simulate.py \
+pixi run -e gpu python simulate.py \
     kernel=cuda_v2 timing_mode=per_stage \
     sim.n_particles=500000 sim.num_grids=64 sim.num_frames=15 \
     benchmark=true
@@ -58,7 +59,7 @@ see [Kernel variants](#kernel-variants) below.
 
 ## Setup
 
-Requires [uv](https://docs.astral.sh/uv/).
+Requires [pixi](https://pixi.sh/).
 
 ```bash
 git clone git@github.com:philipnickel/MPM-CudaJax.git
@@ -67,55 +68,54 @@ cd MPM-CudaJax
 
 **Local (CPU only):**
 ```bash
-uv sync --extra jax
-uv run --extra jax python simulate.py sim.num_frames=5
+pixi install
+pixi run python simulate.py sim.num_frames=5
 ```
 
-**GPU:**
+**GPU (Linux):**
 ```bash
-uv sync --extra jax-cuda          # builds CUDA kernels via CMake at install time
-uv run --extra jax-cuda python simulate.py
+pixi install -e gpu        # builds CUDA kernels via CMake at install time
+pixi run -e gpu python simulate.py
 ```
 
 CUDA kernels are built by [scikit-build-core](https://scikit-build-core.readthedocs.io/)
-+ CMake during `uv sync`. Output `.so` files land in `mpm_jax/cuda/_lib/`
-and are loaded at runtime via `jax.ffi.register_ffi_target`. The build is
-best-effort: when `nvcc` is missing the CMake step returns early, the wheel
-installs cleanly, and the JAX baseline still works.
++ CMake during `pixi install -e gpu`. Output `.so` files land in
+`mpm_jax/cuda/_lib/` and are loaded at runtime via
+`jax.ffi.register_ffi_target`. The build is best-effort: when `nvcc` is
+missing (the default CPU env) CMake's `check_language(CUDA)` returns
+early, the wheel installs cleanly, and the JAX baseline still works.
 
-Override the CUDA architecture at build time:
+Override the CUDA architecture at install time:
 ```bash
-MPM_CUDA_ARCH=sm_86 uv sync --extra jax-cuda     # Ampere
-MPM_CUDA_ARCH=sm_90 uv sync --extra jax-cuda     # Hopper
+MPM_CUDA_ARCH=sm_86 pixi install -e gpu     # Ampere
+MPM_CUDA_ARCH=sm_90 pixi install -e gpu     # Hopper
 # default is 'native' (CMake auto-detects the local GPU)
 ```
 
-**DTU HPC:**
+**DTU HPC:** no `module load` is needed — conda-forge ships `cuda-nvcc`
+and `gxx` inside the `gpu` env. Just:
 ```bash
-module load nvhpc/26.1 gcc/15.2
-export LD_LIBRARY_PATH=/appl/gcc/15.2.0-binutils-2.45/lib64:$LD_LIBRARY_PATH
-export PATH=/appl/nvhpc/2024_249/Linux_aarch64/24.9/cuda/bin:$PATH
-MPM_CUDA_ARCH=sm_90 uv sync --extra jax-cuda
+MPM_CUDA_ARCH=sm_90 pixi install -e gpu
 ```
 
 ## Usage
 
 ```bash
 # Default run (renders GIF to ./output)
-uv run --extra jax-cuda python simulate.py
+pixi run -e gpu python simulate.py
 
 # Benchmark mode (no GIF, no per-frame state capture, wall-clock timing)
-uv run --extra jax-cuda python simulate.py benchmark=true
+pixi run -e gpu python simulate.py benchmark=true
 
 # Pick a kernel
-uv run --extra jax-cuda python simulate.py kernel=jax        # XLA baseline
-uv run --extra jax-cuda python simulate.py kernel=cuda_v2 timing_mode=per_stage  # fully fused (the winner)
-uv run --extra jax-cuda python simulate.py kernel=cuda_v1    # naive atomicAdd scatter
-uv run --extra jax-cuda python simulate.py kernel=cuda_v3    # warp-reduced scatter
-uv run --extra jax-cuda python simulate.py kernel=cuda_v4    # smem-tile scatter (slow — argsort overhead)
+pixi run -e gpu python simulate.py kernel=jax        # XLA baseline
+pixi run -e gpu python simulate.py kernel=cuda_v2 timing_mode=per_stage  # fully fused (the winner)
+pixi run -e gpu python simulate.py kernel=cuda_v1    # naive atomicAdd scatter
+pixi run -e gpu python simulate.py kernel=cuda_v3    # warp-reduced scatter
+pixi run -e gpu python simulate.py kernel=cuda_v4    # smem-tile scatter (slow — argsort overhead)
 
 # Override sim params
-uv run --extra jax-cuda python simulate.py sim.n_particles=1000000 sim.num_grids=64
+pixi run -e gpu python simulate.py sim.n_particles=1000000 sim.num_grids=64
 ```
 
 `kernel=cuda_v2` requires `timing_mode=per_stage`. The fused kernel
@@ -182,12 +182,12 @@ plasticity (constitutive model is hard-coded inside the kernel).
 Pre-baked Hydra multirun sweeps:
 
 ```bash
-uv run --extra jax-cuda python simulate.py -cn sweep_per_stage   # all kernels × particle counts × both timing modes
-uv run --extra jax-cuda python simulate.py -cn sweep_cuda_v2     # cuda_v2 across particle counts
-uv run --extra jax-cuda python simulate.py -cn sweep_baseline    # JAX-only scaling
-uv run --extra jax-cuda python simulate.py -cn sweep_all
-uv run --extra jax-cuda python simulate.py -cn sweep_quick
-uv run --extra jax-cuda python simulate.py -cn sweep_profile
+pixi run -e gpu python simulate.py -cn sweep_per_stage   # all kernels × particle counts × both timing modes
+pixi run -e gpu python simulate.py -cn sweep_cuda_v2     # cuda_v2 across particle counts
+pixi run -e gpu python simulate.py -cn sweep_baseline    # JAX-only scaling
+pixi run -e gpu python simulate.py -cn sweep_all
+pixi run -e gpu python simulate.py -cn sweep_quick
+pixi run -e gpu python simulate.py -cn sweep_profile
 ```
 
 Each combination gets its own `multirun/<date>/<run>/` subdir. Sweeps
@@ -199,13 +199,13 @@ parsers see the structure they expect.
 Three profilers are wired in via the `profile=` config:
 
 ```bash
-uv run --extra jax-cuda python simulate.py profile=nsys benchmark=true \
+pixi run -e gpu python simulate.py profile=nsys benchmark=true \
     kernel=cuda_v2 timing_mode=per_stage sim.n_particles=200000
 
-uv run --extra jax-cuda python simulate.py profile=ncu  benchmark=true \
+pixi run -e gpu python simulate.py profile=ncu  benchmark=true \
     kernel=cuda_v2 timing_mode=per_stage sim.n_particles=10000 sim.num_frames=1
 
-uv run --extra jax-cuda python simulate.py profile=jax  benchmark=true \
+pixi run -e gpu python simulate.py profile=jax  benchmark=true \
     kernel=cuda_v2 timing_mode=per_stage
 ```
 
@@ -255,13 +255,13 @@ Top-level fields: `benchmark`, `timing_mode` (`per_frame` or `per_stage`),
 `tag`, `output_dir`. All overridable from CLI:
 
 ```bash
-uv run --extra jax-cuda python simulate.py sim.n_particles=100000 kernel=cuda_v2 timing_mode=per_stage benchmark=true
+pixi run -e gpu python simulate.py sim.n_particles=100000 kernel=cuda_v2 timing_mode=per_stage benchmark=true
 ```
 
 ## Tests
 
 ```bash
-uv run --extra jax --with pytest python -m pytest tests/ -v
+pixi run test
 ```
 
 32 tests:
@@ -275,9 +275,9 @@ uv run --extra jax --with pytest python -m pytest tests/ -v
 ```
 MPM-CudaJax/
 ├── simulate.py              # Hydra entry + wandb + profiler re-launch
-├── pyproject.toml           # scikit-build-core build, jax / jax-cuda extras
+├── pyproject.toml           # scikit-build-core build + pixi cpu / gpu envs
+├── pixi.lock                # locked deps for both envs (commit this)
 ├── CMakeLists.txt           # CUDA kernel build (called by scikit-build-core)
-├── Makefile                 # setup / cuda / test / sweep / clean shortcuts
 ├── conf/
 │   ├── config.yaml
 │   ├── material/            # jelly.yaml, sand.yaml
