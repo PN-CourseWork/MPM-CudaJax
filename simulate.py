@@ -140,11 +140,11 @@ def run_jax(cfg: DictConfig):
     bench = cfg.get('benchmark', False)
     kernel_name = cfg.get('kernel', {}).get('name', 'jax')
 
-    # Build p2g_fn based on kernel config. cuda_v2 (fused) does its own thing
+    # Build p2g_fn based on kernel config. cuda_fused does its own thing
     # because the kernel covers stress + plasticity + scatter and doesn't fit
     # the (v, C, stress, weight, ...) -> (grid_mv, grid_m) signature.
     p2g_fn = None         # None = default JAX implementation
-    fused_stages = None   # set only for cuda_v2
+    fused_stages = None   # set only for cuda_fused
 
     if kernel_name == 'cuda_v1':
         from mpm_jax.cuda.p2g_cuda import make_cuda_p2g
@@ -152,9 +152,18 @@ def run_jax(cfg: DictConfig):
         if p2g_fn is None:
             raise RuntimeError(
                 "kernel=cuda_v1 requested but CUDA kernel failed to compile/register. "
-                "Check nvcc is on PATH and module load gcc is done."
+                "Run `pixi install -e gpu` in an env where nvcc is on PATH."
             )
-        print("Using CUDA P2G scatter kernel (v1)")
+        print("Using CUDA P2G scatter kernel (v1, naive atomicAdd)")
+    elif kernel_name == 'cuda_v2':
+        from mpm_jax.cuda.p2g_cuda import make_cuda_p2g
+        p2g_fn = make_cuda_p2g(sim.num_grids, kernel='warp')
+        if p2g_fn is None:
+            raise RuntimeError(
+                "kernel=cuda_v2 requested but CUDA kernel failed to compile/register. "
+                "Run `pixi install -e gpu` in an env where nvcc is on PATH."
+            )
+        print("Using CUDA P2G warp-reduction scatter kernel (v2)")
     elif kernel_name == 'cuda_v4':
         from mpm_jax.cuda.p2g_cuda import make_cuda_p2g
         p2g_fn = make_cuda_p2g(sim.num_grids, kernel='smem')
@@ -163,21 +172,12 @@ def run_jax(cfg: DictConfig):
                 "kernel=cuda_v4 requested but CUDA kernel failed to compile/register."
             )
         print("Using CUDA P2G shared-memory scatter kernel (v4)")
-    elif kernel_name == 'cuda_v3':
-        from mpm_jax.cuda.p2g_cuda import make_cuda_p2g
-        p2g_fn = make_cuda_p2g(sim.num_grids, kernel='warp')
-        if p2g_fn is None:
-            raise RuntimeError(
-                "kernel=cuda_v3 requested but CUDA kernel failed to compile/register. "
-                "Check nvcc is on PATH and module load gcc is done."
-            )
-        print("Using CUDA P2G warp-reduction scatter kernel (v3)")
-    elif kernel_name == 'cuda_v2':
-        # cuda_v2 collapses stress / weights / compute / scatter / plasticity
+    elif kernel_name == 'cuda_fused':
+        # cuda_fused collapses stress / weights / compute / scatter / plasticity
         # into a single CUDA kernel launch — no XLA-side intermediates.
         # Implemented only on the per-stage path; per_frame would need a new
         # build_jit_frame_fused() that we don't have.
-        print("Using CUDA fused P2G kernel (v2) — stress + scatter in one launch")
+        print("Using CUDA fully fused P2G + G2P kernel — stress + scatter in one launch")
     else:
         print("Using JAX P2G kernel")
 
@@ -217,9 +217,9 @@ def run_jax(cfg: DictConfig):
             F=jnp.tile(jnp.eye(3), (n, 1, 1)),
         )
 
-    if kernel_name == 'cuda_v2' and timing_mode == 'per_frame':
+    if kernel_name == 'cuda_fused' and timing_mode == 'per_frame':
         raise RuntimeError(
-            "kernel=cuda_v2 (fused) is only wired into the per-stage path. "
+            "kernel=cuda_fused is only wired into the per-stage path. "
             "Run with timing_mode=per_stage."
         )
 
@@ -246,7 +246,7 @@ def run_jax(cfg: DictConfig):
         state = jit_frame(state); jax.block_until_ready(state.x)
         _warmup_metrics(state)
     else:  # per_stage
-        if kernel_name == 'cuda_v2':
+        if kernel_name == 'cuda_fused':
             from mpm_jax.cuda.p2g_cuda import make_fused_stages
             jit_p2g_stage, jit_grid_stage, jit_g2p_stage = make_fused_stages(
                 params, mat.elasticity, mat.plasticity, pre_fn, post_fn)

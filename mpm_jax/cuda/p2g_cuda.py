@@ -2,7 +2,7 @@
 
 The .so files are built at install time by scikit-build-core + CMake (see
 CMakeLists.txt) and shipped inside ``mpm_jax/cuda/_lib/``. Run
-``uv sync --extra jax-cuda`` to (re)build; with ``editable.rebuild=true`` in
+``pixi install -e gpu`` to (re)build; with ``editable.rebuild=true`` in
 pyproject.toml, edits to the .cu sources also trigger a rebuild on import.
 
 Override the CUDA architecture at build time with ``MPM_CUDA_ARCH=sm_86``
@@ -39,7 +39,7 @@ def _register(name: str, so_name: str, symbol: str) -> bool:
         so_path = _shared_library_path(so_name)
         if not so_path.exists():
             logger.warning(
-                "CUDA kernel %s not built. Run `uv sync --extra jax-cuda` "
+                "CUDA kernel %s not built. Run `pixi install -e gpu` "
                 "in an environment where nvcc is on PATH.",
                 so_name,
             )
@@ -292,7 +292,7 @@ def make_cuda_p2g(num_grids, kernel='scatter'):
 
 
 def make_fused_stages(params, elasticity_cfg, plasticity_cfg, pre_particle_fn, post_grid_fn):
-    """Build per-stage JIT'd functions for the cuda_v2 fused kernel.
+    """Build per-stage JIT'd functions for the cuda_fused kernel.
 
     The fused kernel does SVD + plasticity + corotated stress + APIC + scatter
     in one launch. Differences vs the standard per-stage path:
@@ -310,16 +310,16 @@ def make_fused_stages(params, elasticity_cfg, plasticity_cfg, pre_particle_fn, p
     """
     if not is_available('fused'):
         raise RuntimeError(
-            "cuda_v2 fused P2G kernel is not registered (missing .so?). "
-            "Run `uv sync --extra jax-cuda` to build.")
+            "cuda_fused P2G kernel is not registered (missing .so?). "
+            "Run `pixi install -e gpu` to build.")
     if not is_available('g2p_fused'):
         raise RuntimeError(
-            "cuda_v2 fused G2P kernel is not registered (missing .so?). "
-            "Run `uv sync --extra jax-cuda` to build.")
+            "cuda_fused G2P kernel is not registered (missing .so?). "
+            "Run `pixi install -e gpu` to build.")
 
     if elasticity_cfg.name != "CorotatedElasticity":
         raise NotImplementedError(
-            f"cuda_v2 fused kernel only supports CorotatedElasticity, "
+            f"cuda_fused kernel only supports CorotatedElasticity, "
             f"got {elasticity_cfg.name}.")
 
     # Map plasticity config to (theta_c, theta_s, hardening_coeff). The kernel
@@ -334,7 +334,7 @@ def make_fused_stages(params, elasticity_cfg, plasticity_cfg, pre_particle_fn, p
         hardening = float(plasticity_cfg.get("hardening", 10.0))
     else:
         raise NotImplementedError(
-            f"cuda_v2 fused kernel only supports IdentityPlasticity or "
+            f"cuda_fused kernel only supports IdentityPlasticity or "
             f"SnowPlasticity, got {plast_name}.")
 
     E = float(elasticity_cfg.E)
