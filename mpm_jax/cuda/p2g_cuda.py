@@ -87,6 +87,10 @@ def _register_inline():
     return _register("p2g_inline_cuda", "libp2g_inline.so", "P2GInline")
 
 
+def _register_v3_inline():
+    return _register("p2g_v3_inline_cuda", "libp2g_v3_inline.so", "P2GV3Inline")
+
+
 def cuda_p2g_scatter(mv, m, index, num_grids):
     """CUDA P2G scatter via JAX FFI.
 
@@ -210,6 +214,8 @@ def is_available(kernel='scatter'):
         return _register_g2p_fused()
     elif kernel == 'inline':
         return _register_inline()
+    elif kernel == 'v3_inline':
+        return _register_v3_inline()
     return False
 
 
@@ -313,6 +319,125 @@ def build_jit_frame_inline(params, elasticity_fn, plasticity_fn,
                 new_x, new_v, new_C, new_F = g2p(
                     grid_v, weight, dweight, dpos, index,
                     state.F, x, params.dt, params.inv_dx, params.clip_bound)
+
+            new_F = plasticity_fn(new_F)
+            return MPMState(x=new_x, v=new_v, C=new_C, F=new_F), None
+
+        state, _ = jax.lax.scan(scan_body, state, None, length=steps_per_frame)
+        return state
+
+    return jit_frame
+
+
+def cuda_p2g_v3_inline(x, v, C, stress, num_grids, dt, vol, p_mass, inv_dx, dx):
+    """Inline-scatter CUDA P2G with warp-shuffle atomic coalescing (cuda_v3_inline).
+
+    Identical interface to :func:`cuda_p2g_inline`, but the kernel reduces
+    contributions across warp lanes that target the same grid node before
+    issuing the atomic. Combined with Morton-sorted particles (see
+    :func:`mpm_jax.morton.morton_argsort`), this trims a 4-8x factor off
+    the number of global atomics.
+    """
+    N = x.shape[0]
+    G = num_grids
+    G3 = G ** 3
+    C_flat = C.reshape(N, 9)
+    stress_flat = stress.reshape(N, 9)
+
+    grid_mv, grid_m = jax.ffi.ffi_call(
+        "p2g_v3_inline_cuda",
+        (
+            jax.ShapeDtypeStruct((G3, 3), jnp.float32),
+            jax.ShapeDtypeStruct((G3,), jnp.float32),
+        ),
+        vmap_method="broadcast_all",
+    )(
+        x, v, C_flat, stress_flat,
+        N=np.int32(N),
+        G=np.int32(G),
+        dt=np.float32(dt),
+        vol=np.float32(vol),
+        p_mass=np.float32(p_mass),
+        inv_dx=np.float32(inv_dx),
+        dx=np.float32(dx),
+    )
+
+    return grid_mv, grid_m
+
+
+def build_jit_frame_v3_inline(params, elasticity_fn, plasticity_fn,
+                              pre_particle_fn, post_grid_fn, steps_per_frame,
+                              use_cuda_g2p=True):
+    """Per-frame JIT'd function using cuda_v3_inline (Morton sort + warp shuffle).
+
+    Each substep:
+      1. Compute Morton (Z-order) codes from particle cell coords.
+      2. Argsort particles by Morton code and reorder x / v / C / F so
+         spatially-close particles sit in consecutive memory slots.
+      3. Stress (JAX-side elasticity) on the sorted F.
+      4. P2G via :func:`cuda_p2g_v3_inline` — warp lanes that now target the
+         same stencil node share their atomicAdd through `__match_any_sync`.
+      5. Grid update + G2P (CUDA-fused, register-resident).
+      6. Plasticity on the sorted, updated F. Output state stays in sorted
+         order; the next substep just re-sorts on the new positions.
+
+    Output state's particle indices won't match the un-sorted input — use
+    order-invariant metrics (center of mass, KE) when comparing against the
+    cuda_v1_inline baseline.
+    """
+    if not is_available('v3_inline'):
+        raise RuntimeError(
+            "cuda_v3_inline P2G kernel not registered (missing .so?). "
+            "Run `pixi install -e gpu` to build.")
+
+    if use_cuda_g2p and not is_available('g2p_fused'):
+        raise RuntimeError(
+            "cuda g2p kernel not registered (missing .so?). "
+            "Run `pixi install -e gpu` to build, or pass "
+            "use_cuda_g2p=False to fall back to the JAX G2P.")
+
+    from mpm_jax.morton import morton_argsort
+    from mpm_jax.solver import (
+        MPMState,
+        compute_weights_and_indices,
+        g2p,
+        grid_update as grid_update_fn,
+    )
+
+    @jax.jit
+    def jit_frame(state):
+        def scan_body(state, _):
+            # ---- Morton sort: reorder all per-particle arrays in-place ----
+            order = morton_argsort(state.x, params.inv_dx, params.num_grids)
+            x_sorted = state.x[order]
+            v_sorted = state.v[order]
+            C_sorted = state.C[order]
+            F_sorted = state.F[order]
+
+            # ---- Same pipeline as cuda_v1_inline, but on the sorted state ----
+            x, v = pre_particle_fn(x_sorted, v_sorted, 0.0)
+            stress = elasticity_fn(F_sorted)
+            grid_mv, grid_m = cuda_p2g_v3_inline(
+                x, v, C_sorted, stress,
+                params.num_grids, params.dt, params.vol, params.p_mass,
+                params.inv_dx, params.dx,
+            )
+            grid_mv = grid_update_fn(
+                grid_mv, grid_m, params.gravity, params.dt, params.damping)
+            grid_v = post_grid_fn(grid_mv, grid_m, 0.0)
+
+            if use_cuda_g2p:
+                new_x, new_v, new_C, new_F = cuda_g2p_fused(
+                    x, F_sorted, grid_v,
+                    params.num_grids, params.dt,
+                    params.inv_dx, params.dx, params.clip_bound,
+                )
+            else:
+                weight, dweight, dpos, index = compute_weights_and_indices(
+                    x, params.inv_dx, params.dx, params.num_grids)
+                new_x, new_v, new_C, new_F = g2p(
+                    grid_v, weight, dweight, dpos, index,
+                    F_sorted, x, params.dt, params.inv_dx, params.clip_bound)
 
             new_F = plasticity_fn(new_F)
             return MPMState(x=new_x, v=new_v, C=new_C, F=new_F), None

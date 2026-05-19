@@ -1,0 +1,7 @@
+# cuda_v3_inline — cuda_v1_inline + Morton (Z-order) spatial sort of particles
+# before each substep + warp-shuffle (__match_any_sync) atomic coalescing in
+# the 27-stencil scatter loop. Hypothesis: spatially-close particles in the
+# same warp share more stencil-node targets, so the warp reduction folds
+# 4-8x of the global atomics into one. Pair with material=jelly_jacobi for
+# the fast pure-JAX Jacobi SVD upstream. Wired into the per-frame path.
+name: cuda_v3_inline
