@@ -1,3 +1,0 @@
-# CUDA P2G scatter with warp-level reduction (__match_any_sync + __shfl_down_sync).
-# Reduces global atomics by collapsing contributions from warp lanes targeting the same node.
-name: cuda_v3

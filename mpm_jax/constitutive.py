@@ -2,6 +2,8 @@ import math
 import jax
 import jax.numpy as jnp
 
+from mpm_jax.jacobi_svd import jacobi_svd_3x3
+
 
 def _lame_params(E, nu):
     mu = E / (2.0 * (1.0 + nu))
@@ -14,6 +16,27 @@ def corotated_elasticity(E=2e6, nu=0.4):
 
     def compute_stress(F):
         U, sigma, Vh = jnp.linalg.svd(F, full_matrices=False)
+        corotated = 2.0 * mu * (F - U @ Vh) @ jnp.swapaxes(F, -2, -1)
+        J = jnp.prod(sigma, axis=-1).reshape(-1, 1, 1)
+        I = jnp.eye(3, dtype=F.dtype)
+        volume = la * J * (J - 1.0) * I
+        return corotated + volume
+
+    return compute_stress
+
+
+def corotated_elasticity_jacobi(E=2e6, nu=0.4):
+    """CorotatedElasticity with a pure-JAX Jacobi SVD (no cuSOLVER).
+
+    Exists to test whether replacing `jnp.linalg.svd` (a host-dispatched
+    cuSOLVER call) with a fusable pointwise SVD lets XLA fuse the whole
+    stress -> weights -> momentum -> scatter chain into one kernel, avoiding
+    the (N, 27, 3) materialisation. See `mpm_jax/jacobi_svd.py` for details.
+    """
+    mu, la = _lame_params(E, nu)
+
+    def compute_stress(F):
+        U, sigma, Vh = jacobi_svd_3x3(F)
         corotated = 2.0 * mu * (F - U @ Vh) @ jnp.swapaxes(F, -2, -1)
         J = jnp.prod(sigma, axis=-1).reshape(-1, 1, 1)
         I = jnp.eye(3, dtype=F.dtype)
@@ -87,6 +110,7 @@ def volume_elasticity(E=2e6, nu=0.4, mode="taichi"):
 
 ELASTICITY = {
     "CorotatedElasticity": corotated_elasticity,
+    "CorotatedElasticityJacobi": corotated_elasticity_jacobi,
     "SigmaElasticity": sigma_elasticity,
     "StVKElasticity": stvk_elasticity,
     "FluidElasticity": fluid_elasticity,

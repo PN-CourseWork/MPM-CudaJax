@@ -1,0 +1,4 @@
+# Fully fused CUDA P2G + G2P: stress + weights + compute + scatter in one kernel.
+# One thread per particle, all intermediate state in registers. Not part of the
+# numbered v1..v6 lineage from the project plan — this is a separate fused path.
+name: cuda_fused

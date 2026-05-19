@@ -1,8 +1,8 @@
 # Per-stage vs per-frame JIT comparison.
-# Usage: uv run --extra jax-cuda python simulate.py -cn sweep_per_stage
+# Usage: pixi run -e gpu python simulate.py -cn sweep_per_stage
 #
 # 4 particle counts x 4 kernels x 2 timing modes = 32 runs.
-# Each run is benchmark mode (no GIF), 30 frames * 10 substeps = 300 steps.
+# Each run is benchmark mode (no GIF), 5 frames * 10 substeps = 50 steps.
 defaults:
   - config
   - _self_
@@ -12,7 +12,7 @@ hydra:
   sweeper:
     params:
       sim.n_particles: 5000,50000,200000,500000
-      kernel: jax,cuda_v1,cuda_v3,cuda_v4
+      kernel: jax,cuda_v1,cuda_v2,cuda_v4
       timing_mode: per_frame,per_stage
 
 benchmark: true

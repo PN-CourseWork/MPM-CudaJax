@@ -2,7 +2,7 @@
 
 The .so files are built at install time by scikit-build-core + CMake (see
 CMakeLists.txt) and shipped inside ``mpm_jax/cuda/_lib/``. Run
-``uv sync --extra jax-cuda`` to (re)build; with ``editable.rebuild=true`` in
+``pixi install -e gpu`` to (re)build; with ``editable.rebuild=true`` in
 pyproject.toml, edits to the .cu sources also trigger a rebuild on import.
 
 Override the CUDA architecture at build time with ``MPM_CUDA_ARCH=sm_86``
@@ -39,7 +39,7 @@ def _register(name: str, so_name: str, symbol: str) -> bool:
         so_path = _shared_library_path(so_name)
         if not so_path.exists():
             logger.warning(
-                "CUDA kernel %s not built. Run `uv sync --extra jax-cuda` "
+                "CUDA kernel %s not built. Run `pixi install -e gpu` "
                 "in an environment where nvcc is on PATH.",
                 so_name,
             )
@@ -81,6 +81,10 @@ def _register_fused():
 
 def _register_g2p_fused():
     return _register("g2p_fused_cuda", "libg2p_fused.so", "G2PFused")
+
+
+def _register_inline():
+    return _register("p2g_inline_cuda", "libp2g_inline.so", "P2GInline")
 
 
 def cuda_p2g_scatter(mv, m, index, num_grids):
@@ -204,7 +208,119 @@ def is_available(kernel='scatter'):
         return _register_fused()
     elif kernel == 'g2p_fused':
         return _register_g2p_fused()
+    elif kernel == 'inline':
+        return _register_inline()
     return False
+
+
+def cuda_p2g_inline(x, v, C, stress, num_grids, dt, vol, p_mass, inv_dx, dx):
+    """Inline-scatter CUDA P2G via JAX FFI (cuda_v1_inline).
+
+    Takes per-particle state including precomputed stress (from JAX-side
+    Jacobi SVD). One CUDA kernel launch, one thread per particle, with a
+    register-resident 27-stencil loop. No (N, 27, *) tensor materialised.
+
+    Drop-in replacement for solver.p2g_compute + solver.p2g_scatter when
+    stress has already been computed by an upstream elasticity model.
+    """
+    N = x.shape[0]
+    G = num_grids
+    G3 = G ** 3
+    C_flat = C.reshape(N, 9)
+    stress_flat = stress.reshape(N, 9)
+
+    grid_mv, grid_m = jax.ffi.ffi_call(
+        "p2g_inline_cuda",
+        (
+            jax.ShapeDtypeStruct((G3, 3), jnp.float32),
+            jax.ShapeDtypeStruct((G3,), jnp.float32),
+        ),
+        vmap_method="broadcast_all",
+    )(
+        x, v, C_flat, stress_flat,
+        N=np.int32(N),
+        G=np.int32(G),
+        dt=np.float32(dt),
+        vol=np.float32(vol),
+        p_mass=np.float32(p_mass),
+        inv_dx=np.float32(inv_dx),
+        dx=np.float32(dx),
+    )
+
+    return grid_mv, grid_m
+
+
+def build_jit_frame_inline(params, elasticity_fn, plasticity_fn,
+                           pre_particle_fn, post_grid_fn, steps_per_frame,
+                           use_cuda_g2p=True):
+    """Per-frame JIT'd function using the cuda_v1_inline P2G kernel.
+
+    Mirrors ``solver.build_jit_frame`` but routes P2G through one CUDA
+    kernel call (inline weights + 27-stencil atomic scatter per particle,
+    no ``(N, 27, *)`` momentum tensor in HBM). When ``use_cuda_g2p=True``
+    (the default), the G2P gather also uses a CUDA kernel
+    (``g2p_fused.cu``) so the ``(N, 27, *)`` weight/dweight/dpos/index
+    tensors don't materialise on the G2P side either.
+
+    Result is one ``@jax.jit`` + ``lax.scan`` over ``steps_per_frame`` —
+    a single XLA program per frame. Stress and plasticity stay in JAX
+    (model-agnostic); only the two scatter/gather kernels are CUDA.
+    """
+    if not is_available('inline'):
+        raise RuntimeError(
+            "cuda_v1_inline P2G kernel not registered (missing .so?). "
+            "Run `pixi install -e gpu` to build.")
+
+    if use_cuda_g2p and not is_available('g2p_fused'):
+        raise RuntimeError(
+            "cuda g2p kernel not registered (missing .so?). "
+            "Run `pixi install -e gpu` to build, or pass "
+            "use_cuda_g2p=False to fall back to the JAX G2P.")
+
+    from mpm_jax.solver import (
+        MPMState,
+        compute_weights_and_indices,
+        g2p,
+        grid_update as grid_update_fn,
+    )
+
+    @jax.jit
+    def jit_frame(state):
+        def scan_body(state, _):
+            x, v = pre_particle_fn(state.x, state.v, 0.0)
+            stress = elasticity_fn(state.F)
+            grid_mv, grid_m = cuda_p2g_inline(
+                x, v, state.C, stress,
+                params.num_grids, params.dt, params.vol, params.p_mass,
+                params.inv_dx, params.dx,
+            )
+            grid_mv = grid_update_fn(
+                grid_mv, grid_m, params.gravity, params.dt, params.damping)
+            grid_v = post_grid_fn(grid_mv, grid_m, 0.0)
+
+            if use_cuda_g2p:
+                # CUDA G2P: gather + grad_v + state update, register-resident
+                # 27-loop. No (N, 27, *) tensors anywhere in this substep.
+                new_x, new_v, new_C, new_F = cuda_g2p_fused(
+                    x, state.F, grid_v,
+                    params.num_grids, params.dt,
+                    params.inv_dx, params.dx, params.clip_bound,
+                )
+            else:
+                # JAX G2P (materialises (N, 27, *) weights for the gather).
+                weight, dweight, dpos, index = compute_weights_and_indices(
+                    x, params.inv_dx, params.dx, params.num_grids)
+                new_x, new_v, new_C, new_F = g2p(
+                    grid_v, weight, dweight, dpos, index,
+                    state.F, x, params.dt, params.inv_dx, params.clip_bound)
+
+            new_F = plasticity_fn(new_F)
+            return MPMState(x=new_x, v=new_v, C=new_C, F=new_F), None
+
+        state, _ = jax.lax.scan(scan_body, state, None, length=steps_per_frame)
+        return state
+
+    return jit_frame
 
 
 def cuda_g2p_fused(x, F, grid_v, num_grids, dt, inv_dx, dx, clip_bound):
@@ -292,7 +408,7 @@ def make_cuda_p2g(num_grids, kernel='scatter'):
 
 
 def make_fused_stages(params, elasticity_cfg, plasticity_cfg, pre_particle_fn, post_grid_fn):
-    """Build per-stage JIT'd functions for the cuda_v2 fused kernel.
+    """Build per-stage JIT'd functions for the cuda_fused kernel.
 
     The fused kernel does SVD + plasticity + corotated stress + APIC + scatter
     in one launch. Differences vs the standard per-stage path:
@@ -310,16 +426,16 @@ def make_fused_stages(params, elasticity_cfg, plasticity_cfg, pre_particle_fn, p
     """
     if not is_available('fused'):
         raise RuntimeError(
-            "cuda_v2 fused P2G kernel is not registered (missing .so?). "
-            "Run `uv sync --extra jax-cuda` to build.")
+            "cuda_fused P2G kernel is not registered (missing .so?). "
+            "Run `pixi install -e gpu` to build.")
     if not is_available('g2p_fused'):
         raise RuntimeError(
-            "cuda_v2 fused G2P kernel is not registered (missing .so?). "
-            "Run `uv sync --extra jax-cuda` to build.")
+            "cuda_fused G2P kernel is not registered (missing .so?). "
+            "Run `pixi install -e gpu` to build.")
 
     if elasticity_cfg.name != "CorotatedElasticity":
         raise NotImplementedError(
-            f"cuda_v2 fused kernel only supports CorotatedElasticity, "
+            f"cuda_fused kernel only supports CorotatedElasticity, "
             f"got {elasticity_cfg.name}.")
 
     # Map plasticity config to (theta_c, theta_s, hardening_coeff). The kernel
@@ -334,7 +450,7 @@ def make_fused_stages(params, elasticity_cfg, plasticity_cfg, pre_particle_fn, p
         hardening = float(plasticity_cfg.get("hardening", 10.0))
     else:
         raise NotImplementedError(
-            f"cuda_v2 fused kernel only supports IdentityPlasticity or "
+            f"cuda_fused kernel only supports IdentityPlasticity or "
             f"SnowPlasticity, got {plast_name}.")
 
     E = float(elasticity_cfg.E)
