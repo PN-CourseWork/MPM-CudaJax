@@ -1,0 +1,34 @@
+# Scaling sweep — JAX baseline + the three inline CUDA variants at
+# multiple particle counts. After the sweep finishes, ScalingPlotCallback
+# fires and writes results.csv + scaling_ms_per_step.png + scaling_speedup.png
+# into the multirun root.
+#
+# Usage:
+#   pixi run -e gpu python simulate.py -cn sweep_scaling
+#
+# All four variants share material=jelly_jacobi (Jacobi SVD in JAX) +
+# per_frame timing. cuda_fused (which needs per_stage + material=jelly)
+# is not included here — run it separately and merge the CSVs if needed.
+
+defaults:
+  - config
+  - override /material: jelly_jacobi
+  - _self_
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      sim.n_particles: 50000,200000,500000,1000000,5000000
+      kernel: jax,cuda_v1_inline,cuda_v2_inline,cuda_v3_inline
+  callbacks:
+    scaling_plot:
+      _target_: mpm_jax.callbacks.ScalingPlotCallback
+      baseline_kernel: jax
+
+benchmark: true
+tag: scaling_sweep
+timing_mode: per_frame
+sim:
+  num_frames: 10
+  num_grids: 64

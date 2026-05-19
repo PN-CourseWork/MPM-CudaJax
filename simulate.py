@@ -832,6 +832,30 @@ def main(cfg: DictConfig):
     elif cfg.get('benchmark', False):
         print("\nBenchmark mode: skipping GIF rendering.")
 
+    # Dump a small results.json into the Hydra run dir so multirun callbacks
+    # (and any post-hoc aggregation) can pick up the per-run numbers without
+    # touching wandb. One file per run, fixed shape.
+    import json
+    from hydra.core.hydra_config import HydraConfig
+    run_dir = os.path.abspath(HydraConfig.get().runtime.output_dir)
+    mat_name = cfg.get('material', {}).get('elasticity', {}).get('name', None) \
+        or cfg.get('material', {}).get('name', 'unknown')
+    results = {
+        'kernel': kernel_name,
+        'material_elasticity': mat_name,
+        'n_particles': int(cfg.sim.n_particles),
+        'num_grids': int(cfg.sim.num_grids),
+        'timing_mode': cfg.get('timing_mode', 'per_frame'),
+        'num_frames': int(cfg.sim.num_frames),
+        'steps_per_frame': int(cfg.sim.steps_per_frame),
+        'total_steps': int(total_steps),
+        'elapsed_s': float(elapsed),
+        'ms_per_step': float(ms_per_step),
+        'steps_per_sec': float(steps_per_sec),
+    }
+    with open(os.path.join(run_dir, 'results.json'), 'w') as f:
+        json.dump(results, f, indent=2)
+
     # Log timing results to wandb
     log_results(kernel_name, elapsed, total_steps, summary, frame_metrics, frames, cfg, export_path)
 
