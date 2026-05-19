@@ -72,6 +72,13 @@ gxx = "*"
 [tool.pixi.feature.gpu.system-requirements]
 cuda = "12.0"
 
+# Nsight profilers (nsys / ncu) for `simulate.py profile=nsys|ncu` are
+# NOT shipped via conda — NVIDIA doesn't publish `nsight-systems` on
+# conda-forge or the nvidia channel. Install them system-wide on the
+# benchmark host:
+#     sudo apt-get install nsight-systems nsight-compute
+# Both end up on PATH and `simulate.py` picks them up from there.
+
 [tool.pixi.environments]
 default = { features = ["cpu", "dev"], solve-group = "cpu" }
 gpu = { features = ["gpu", "dev"], solve-group = "gpu" }
