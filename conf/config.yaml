@@ -10,7 +10,7 @@ tag: jelly
 benchmark: false  # skip GIF rendering and frame saving when true
 # per_frame: monolithic lax.scan JIT (one XLA program for the whole frame).
 # per_stage: Python loop with p2g/grid_update/g2p individually JIT'd. Required
-#            for cuda_v2 (fused kernel doesn't fit the per_frame signature).
+#            for cuda_fused (fused kernel doesn't fit the per_frame signature).
 # Both modes sync the GPU once per frame for wall-clock measurement only -
 # use nsys/ncu (profile=nsys / profile=ncu) for per-stage breakdown.
 timing_mode: per_frame
