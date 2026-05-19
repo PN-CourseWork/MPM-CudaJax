@@ -4,11 +4,11 @@ __pycache__/
 dist/
 build/
 .venv/
+.pixi/
 *.egg
 mpm_jax/cuda/_lib/
 output/
 outputs/
-uv.lock
 .pytest_cache/
 wandb/
 
