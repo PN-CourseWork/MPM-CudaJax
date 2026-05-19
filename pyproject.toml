@@ -57,5 +57,19 @@ jaxlib = ">=0.4.20"
 pytest = "*"
 ruff = "*"
 
+[tool.pixi.feature.gpu]
+platforms = ["linux-64", "linux-aarch64"]
+
+[tool.pixi.feature.gpu.dependencies]
+jax = ">=0.4.20"
+jaxlib = { version = ">=0.4.20", build = "*cuda12*" }
+cuda-version = "12.*"
+cuda-nvcc = "*"
+gxx = "*"
+
+[tool.pixi.feature.gpu.system-requirements]
+cuda = "12.0"
+
 [tool.pixi.environments]
 default = { features = ["cpu", "dev"], solve-group = "cpu" }
+gpu = { features = ["gpu", "dev"], solve-group = "gpu" }
