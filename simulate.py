@@ -185,6 +185,11 @@ def run_jax(cfg: DictConfig):
         # Jacobi SVD). Wired into the per-frame path: the FFI call lives
         # inside lax.scan so the whole frame compiles to one XLA program.
         print("Using CUDA inline P2G kernel (cuda_v1_inline) — JAX stress + register-resident scatter")
+    elif kernel_name == 'jax_v1_5':
+        # Pure JAX, but the (N, 27, *) momentum/mass intermediate is replaced
+        # by a lax.scan over the 27 stencil offsets. Per-stage only — the
+        # P2G stage has a structurally different shape from solver.build_jit_frame.
+        print("Using JAX P2G with lax.scan over 27 stencil offsets (jax_v1_5)")
     else:
         print("Using JAX P2G kernel")
 
@@ -227,6 +232,11 @@ def run_jax(cfg: DictConfig):
     if kernel_name == 'cuda_fused' and timing_mode == 'per_frame':
         raise RuntimeError(
             "kernel=cuda_fused is only wired into the per-stage path. "
+            "Run with timing_mode=per_stage."
+        )
+    if kernel_name == 'jax_v1_5' and timing_mode == 'per_frame':
+        raise RuntimeError(
+            "kernel=jax_v1_5 is only wired into the per-stage path. "
             "Run with timing_mode=per_stage."
         )
 
@@ -277,6 +287,10 @@ def run_jax(cfg: DictConfig):
             from mpm_jax.cuda.p2g_cuda import make_fused_stages
             jit_p2g_stage, jit_grid_stage, jit_g2p_stage = make_fused_stages(
                 params, mat.elasticity, mat.plasticity, pre_fn, post_fn)
+        elif kernel_name == 'jax_v1_5':
+            from mpm_jax.p2g_scan import build_jit_stages_scan
+            jit_p2g_stage, jit_grid_stage, jit_g2p_stage = build_jit_stages_scan(
+                params, elasticity_fn, plasticity_fn, pre_fn, post_fn)
         else:
             jit_p2g_stage, jit_grid_stage, jit_g2p_stage = build_jit_stages(
                 params, elasticity_fn, plasticity_fn, pre_fn, post_fn, p2g_fn=p2g_fn)
