@@ -1,9 +1,9 @@
-# cuda_v2 fused-kernel benchmark sweep (per-stage path only).
+# cuda_fused (fully fused P2G+G2P) benchmark sweep (per-stage path only).
 # Pair this with sweep_per_stage to get the full apples-to-apples comparison.
-# Usage: uv run --extra jax-cuda python simulate.py -cn sweep_cuda_v2
+# Usage: pixi run -e gpu python simulate.py -cn sweep_cuda_fused
 defaults:
   - config
-  - override /kernel: cuda_v2
+  - override /kernel: cuda_fused
   - _self_
 
 hydra:
@@ -13,7 +13,7 @@ hydra:
       sim.n_particles: 5000,50000,200000,500000
 
 benchmark: true
-tag: cuda_v2_sweep
+tag: cuda_fused_sweep
 timing_mode: per_stage
 sim:
   num_frames: 5

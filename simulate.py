@@ -126,7 +126,33 @@ class StageTimer:
 # Backend-specific runners
 # ---------------------------------------------------------------------------
 
+def _maybe_enable_cuda_graphs(kernel_name):
+    """Toggle XLA command-buffer capture (= CUDA Graphs) for the v6 kernel.
+
+    Must be called BEFORE the first `import jax`, otherwise XLA has already
+    parsed XLA_FLAGS and the new value is ignored. Routed from run_jax() at
+    its very top, and (defensively) from main() before any jax import.
+
+    Project plan v6: capture the repeating P2G -> grid_update -> G2P substep
+    as a CUDA Graph and replay it. Concretely we ask XLA to wrap FUSION,
+    CUSTOM_CALL (our FFI scatter / fused G2P) and WHILE (the lax.scan
+    substep loop) into command buffers, which the GPU runtime executes as
+    a single replayed graph per substep.
+    """
+    if kernel_name != 'cuda_v6_inline':
+        return
+    extra = "--xla_gpu_enable_command_buffer=FUSION,CUSTOM_CALL,WHILE"
+    cur = os.environ.get("XLA_FLAGS", "")
+    if extra not in cur:
+        os.environ["XLA_FLAGS"] = (cur + " " + extra).strip()
+        print(f"cuda_v6_inline: enabling XLA CUDA Graph capture via XLA_FLAGS={os.environ['XLA_FLAGS']}")
+
+
 def run_jax(cfg: DictConfig):
+    # Must come BEFORE `import jax` — XLA reads XLA_FLAGS once at startup.
+    kernel_name = cfg.get('kernel', {}).get('name', 'jax')
+    _maybe_enable_cuda_graphs(kernel_name)
+
     import jax
     import jax.numpy as jnp
     from mpm_jax.solver import (
@@ -138,13 +164,12 @@ def run_jax(cfg: DictConfig):
     sim = cfg.sim
     mat = cfg.material
     bench = cfg.get('benchmark', False)
-    kernel_name = cfg.get('kernel', {}).get('name', 'jax')
 
-    # Build p2g_fn based on kernel config. cuda_v2 (fused) does its own thing
+    # Build p2g_fn based on kernel config. cuda_fused does its own thing
     # because the kernel covers stress + plasticity + scatter and doesn't fit
     # the (v, C, stress, weight, ...) -> (grid_mv, grid_m) signature.
     p2g_fn = None         # None = default JAX implementation
-    fused_stages = None   # set only for cuda_v2
+    fused_stages = None   # set only for cuda_fused
 
     if kernel_name == 'cuda_v1':
         from mpm_jax.cuda.p2g_cuda import make_cuda_p2g
@@ -152,9 +177,18 @@ def run_jax(cfg: DictConfig):
         if p2g_fn is None:
             raise RuntimeError(
                 "kernel=cuda_v1 requested but CUDA kernel failed to compile/register. "
-                "Check nvcc is on PATH and module load gcc is done."
+                "Run `pixi install -e gpu` in an env where nvcc is on PATH."
             )
-        print("Using CUDA P2G scatter kernel (v1)")
+        print("Using CUDA P2G scatter kernel (v1, naive atomicAdd)")
+    elif kernel_name == 'cuda_v2':
+        from mpm_jax.cuda.p2g_cuda import make_cuda_p2g
+        p2g_fn = make_cuda_p2g(sim.num_grids, kernel='warp')
+        if p2g_fn is None:
+            raise RuntimeError(
+                "kernel=cuda_v2 requested but CUDA kernel failed to compile/register. "
+                "Run `pixi install -e gpu` in an env where nvcc is on PATH."
+            )
+        print("Using CUDA P2G warp-reduction scatter kernel (v2)")
     elif kernel_name == 'cuda_v4':
         from mpm_jax.cuda.p2g_cuda import make_cuda_p2g
         p2g_fn = make_cuda_p2g(sim.num_grids, kernel='smem')
@@ -163,21 +197,51 @@ def run_jax(cfg: DictConfig):
                 "kernel=cuda_v4 requested but CUDA kernel failed to compile/register."
             )
         print("Using CUDA P2G shared-memory scatter kernel (v4)")
-    elif kernel_name == 'cuda_v3':
-        from mpm_jax.cuda.p2g_cuda import make_cuda_p2g
-        p2g_fn = make_cuda_p2g(sim.num_grids, kernel='warp')
-        if p2g_fn is None:
-            raise RuntimeError(
-                "kernel=cuda_v3 requested but CUDA kernel failed to compile/register. "
-                "Check nvcc is on PATH and module load gcc is done."
-            )
-        print("Using CUDA P2G warp-reduction scatter kernel (v3)")
-    elif kernel_name == 'cuda_v2':
-        # cuda_v2 collapses stress / weights / compute / scatter / plasticity
+    elif kernel_name == 'cuda_fused':
+        # cuda_fused collapses stress / weights / compute / scatter / plasticity
         # into a single CUDA kernel launch — no XLA-side intermediates.
         # Implemented only on the per-stage path; per_frame would need a new
         # build_jit_frame_fused() that we don't have.
-        print("Using CUDA fused P2G kernel (v2) — stress + scatter in one launch")
+        print("Using CUDA fully fused P2G + G2P kernel — stress + scatter in one launch")
+    elif kernel_name == 'cuda_v1_inline':
+        # cuda_v1_inline: one CUDA kernel for inline-weights + 27-stencil
+        # atomic scatter, one thread per particle, register-resident loop.
+        # JAX does stress upstream (use material=jelly_jacobi for the fast
+        # Jacobi SVD). Wired into the per-frame path: the FFI call lives
+        # inside lax.scan so the whole frame compiles to one XLA program.
+        print("Using CUDA inline P2G kernel (cuda_v1_inline) — JAX stress + register-resident scatter")
+    elif kernel_name == 'cuda_v2_inline':
+        # cuda_v2_inline: same as cuda_v1_inline but with warp-shuffle
+        # reduction (__match_any_sync + __shfl_xor_sync) folded into every
+        # atomicAdd inside the 27-stencil loop. Tests whether warp coalescing
+        # helps once the (N, 27, *) materialisation overhead is gone.
+        print("Using CUDA inline P2G kernel with warp shuffle (cuda_v2_inline)")
+    elif kernel_name == 'cuda_v3_inline':
+        # cuda_v3_inline: cuda_v1_inline + Morton (Z-order) spatial sort of
+        # particles before each substep + warp-shuffle atomic coalescing.
+        # Hypothesis: spatially-close particles in the same warp share more
+        # stencil-node targets, so `__match_any_sync` collapses 4-8x of the
+        # atomics into one. Tradeoff: an argsort per substep (O(N log N)).
+        print("Using CUDA inline P2G kernel with Morton sort + warp shuffle (cuda_v3_inline)")
+    elif kernel_name == 'cuda_v6_inline':
+        # cuda_v6_inline: exactly the cuda_v3_inline pipeline (Morton sort +
+        # warp-shuffle inline scatter + fused G2P), but with XLA's command
+        # buffer / CUDA Graph capture enabled via XLA_FLAGS. The substep
+        # body (FUSION + CUSTOM_CALL + WHILE) is wrapped into a CUDA Graph
+        # and replayed each substep, eliminating most of the per-kernel
+        # launch dispatch overhead. Project plan v6 (L4: Streams & Graphs).
+        print("Using cuda_v3_inline pipeline replayed through XLA CUDA Graph capture (cuda_v6_inline)")
+    elif kernel_name == 'cuda_v4_inline':
+        # cuda_v4_inline: cell-major scheduling + 4^3 shared-memory tile +
+        # inline weights. JAX sorts particles by home cell every substep and
+        # passes (sorted x, v, C, stress, cell_start) to one CUDA launch.
+        # Per-frame only (the sort + ffi call live inside lax.scan).
+        print("Using CUDA cell-major + smem-tile inline P2G kernel (cuda_v4_inline)")
+    elif kernel_name == 'jax_v1_5':
+        # Pure JAX, but the (N, 27, *) momentum/mass intermediate is replaced
+        # by a lax.scan over the 27 stencil offsets. Per-stage only — the
+        # P2G stage has a structurally different shape from solver.build_jit_frame.
+        print("Using JAX P2G with lax.scan over 27 stencil offsets (jax_v1_5)")
     else:
         print("Using JAX P2G kernel")
 
@@ -217,10 +281,47 @@ def run_jax(cfg: DictConfig):
             F=jnp.tile(jnp.eye(3), (n, 1, 1)),
         )
 
-    if kernel_name == 'cuda_v2' and timing_mode == 'per_frame':
+    if kernel_name == 'cuda_fused' and timing_mode == 'per_frame':
         raise RuntimeError(
-            "kernel=cuda_v2 (fused) is only wired into the per-stage path. "
+            "kernel=cuda_fused is only wired into the per-stage path. "
             "Run with timing_mode=per_stage."
+        )
+    if kernel_name == 'jax_v1_5' and timing_mode == 'per_frame':
+        raise RuntimeError(
+            "kernel=jax_v1_5 is only wired into the per-stage path. "
+            "Run with timing_mode=per_stage."
+        )
+
+    if kernel_name == 'cuda_v1_inline' and timing_mode == 'per_stage':
+        raise RuntimeError(
+            "kernel=cuda_v1_inline is only wired into the per-frame path "
+            "(by design — the whole frame compiles to one XLA program). "
+            "Run with timing_mode=per_frame."
+        )
+    if kernel_name == 'cuda_v2_inline' and timing_mode == 'per_stage':
+        raise RuntimeError(
+            "kernel=cuda_v2_inline is only wired into the per-frame path "
+            "(by design — the whole frame compiles to one XLA program). "
+            "Run with timing_mode=per_frame."
+        )
+
+    if kernel_name == 'cuda_v3_inline' and timing_mode == 'per_stage':
+        raise RuntimeError(
+            "kernel=cuda_v3_inline is only wired into the per-frame path. "
+            "Run with timing_mode=per_frame."
+        )
+    if kernel_name == 'cuda_v6_inline' and timing_mode == 'per_stage':
+        raise RuntimeError(
+            "kernel=cuda_v6_inline is only wired into the per-frame path "
+            "(CUDA Graph capture wraps the lax.scan substep loop). "
+            "Run with timing_mode=per_frame."
+        )
+
+    if kernel_name == 'cuda_v4_inline' and timing_mode == 'per_stage':
+        raise RuntimeError(
+            "kernel=cuda_v4_inline is only wired into the per-frame path "
+            "(the JAX-side sort and FFI call both live inside lax.scan). "
+            "Run with timing_mode=per_frame."
         )
 
     def _warmup_metrics(s):
@@ -231,25 +332,92 @@ def run_jax(cfg: DictConfig):
 
     # ---- Build the substep function for whichever timing_mode is selected ----
     if timing_mode == 'per_frame':
-        jit_step = build_jit_step(params, elasticity_fn, plasticity_fn,
-                                  pre_fn, post_fn, p2g_fn=p2g_fn)
-        jit_frame = build_jit_frame(params, elasticity_fn, plasticity_fn,
-                                    pre_fn, post_fn, sim.steps_per_frame, p2g_fn=p2g_fn)
+        if kernel_name == 'cuda_v1_inline':
+            from mpm_jax.cuda.p2g_cuda import build_jit_frame_inline
+            jit_frame = build_jit_frame_inline(
+                params, elasticity_fn, plasticity_fn,
+                pre_fn, post_fn, sim.steps_per_frame)
 
-        def run_frame(s):
-            return jit_frame(s)
+            def run_frame(s):
+                return jit_frame(s)
 
-        # Warmup: trace+compile everything we'll use in the timed region.
-        state = make_state()
-        state = jit_step(state); jax.block_until_ready(state.x)
-        state = make_state()
-        state = jit_frame(state); jax.block_until_ready(state.x)
-        _warmup_metrics(state)
+            state = make_state()
+            state = jit_frame(state); jax.block_until_ready(state.x)
+            _warmup_metrics(state)
+        elif kernel_name == 'cuda_v2_inline':
+            from mpm_jax.cuda.p2g_cuda import build_jit_frame_v2_inline
+            jit_frame = build_jit_frame_v2_inline(
+                params, elasticity_fn, plasticity_fn,
+                pre_fn, post_fn, sim.steps_per_frame)
+
+            def run_frame(s):
+                return jit_frame(s)
+
+            state = make_state()
+            state = jit_frame(state); jax.block_until_ready(state.x)
+            _warmup_metrics(state)
+        elif kernel_name == 'cuda_v3_inline':
+            from mpm_jax.cuda.p2g_cuda import build_jit_frame_v3_inline
+            jit_frame = build_jit_frame_v3_inline(
+                params, elasticity_fn, plasticity_fn,
+                pre_fn, post_fn, sim.steps_per_frame)
+
+            def run_frame(s):
+                return jit_frame(s)
+
+            state = make_state()
+            state = jit_frame(state); jax.block_until_ready(state.x)
+            _warmup_metrics(state)
+        elif kernel_name == 'cuda_v6_inline':
+            # Same compute path as cuda_v3_inline; the CUDA-Graph capture
+            # comes from XLA_FLAGS set in _maybe_enable_cuda_graphs() above.
+            from mpm_jax.cuda.p2g_cuda import build_jit_frame_v3_inline
+            jit_frame = build_jit_frame_v3_inline(
+                params, elasticity_fn, plasticity_fn,
+                pre_fn, post_fn, sim.steps_per_frame)
+
+            def run_frame(s):
+                return jit_frame(s)
+
+            state = make_state()
+            state = jit_frame(state); jax.block_until_ready(state.x)
+            _warmup_metrics(state)
+        elif kernel_name == 'cuda_v4_inline':
+            from mpm_jax.cuda.p2g_cuda import build_jit_frame_v4_inline
+            jit_frame = build_jit_frame_v4_inline(
+                params, elasticity_fn, plasticity_fn,
+                pre_fn, post_fn, sim.steps_per_frame)
+
+            def run_frame(s):
+                return jit_frame(s)
+
+            state = make_state()
+            state = jit_frame(state); jax.block_until_ready(state.x)
+            _warmup_metrics(state)
+        else:
+            jit_step = build_jit_step(params, elasticity_fn, plasticity_fn,
+                                      pre_fn, post_fn, p2g_fn=p2g_fn)
+            jit_frame = build_jit_frame(params, elasticity_fn, plasticity_fn,
+                                        pre_fn, post_fn, sim.steps_per_frame, p2g_fn=p2g_fn)
+
+            def run_frame(s):
+                return jit_frame(s)
+
+            # Warmup: trace+compile everything we'll use in the timed region.
+            state = make_state()
+            state = jit_step(state); jax.block_until_ready(state.x)
+            state = make_state()
+            state = jit_frame(state); jax.block_until_ready(state.x)
+            _warmup_metrics(state)
     else:  # per_stage
-        if kernel_name == 'cuda_v2':
+        if kernel_name == 'cuda_fused':
             from mpm_jax.cuda.p2g_cuda import make_fused_stages
             jit_p2g_stage, jit_grid_stage, jit_g2p_stage = make_fused_stages(
                 params, mat.elasticity, mat.plasticity, pre_fn, post_fn)
+        elif kernel_name == 'jax_v1_5':
+            from mpm_jax.p2g_scan import build_jit_stages_scan
+            jit_p2g_stage, jit_grid_stage, jit_g2p_stage = build_jit_stages_scan(
+                params, elasticity_fn, plasticity_fn, pre_fn, post_fn)
         else:
             jit_p2g_stage, jit_grid_stage, jit_g2p_stage = build_jit_stages(
                 params, elasticity_fn, plasticity_fn, pre_fn, post_fn, p2g_fn=p2g_fn)
@@ -489,8 +657,111 @@ def _extract_nsys_stats(cfg):
     print(f"Uploaded {report_path} as wandb artifact.")
 
 
+def _parse_ncu_csv(csv_path):
+    """Parse the long-format ncu CSV (`ncu --set full --csv` output).
+
+    The file is a regular CSV preceded by `==PROF==` status lines. Each
+    data row is (kernel invocation, metric) -> value. We collapse to a
+    per-kernel summary keyed on the demangled kernel name.
+
+    Returns a dict: {kernel_name: {
+        'launches': int,
+        'duration_us_total': float,
+        'duration_us_avg': float,
+        'metrics': {metric_name: [values...]},  # per-launch averages
+    }}
+    """
+    import csv
+    from collections import defaultdict
+
+    rows = []
+    header = None
+    with open(csv_path) as f:
+        # Skip ==PROF== / ==ERROR== prelude until we find the CSV header.
+        for line in f:
+            stripped = line.strip()
+            if stripped.startswith('"ID"') or stripped.startswith('ID,'):
+                header = next(csv.reader([line]))
+                break
+        if header is None:
+            return None
+        rows = list(csv.DictReader(f, fieldnames=header))
+
+    # Each kernel launch shows up as N rows (one per metric). Group on
+    # (kernel name, ID) so we can count distinct launches.
+    by_kernel = defaultdict(lambda: {'launch_ids': set(), 'metrics': defaultdict(list)})
+    for row in rows:
+        kname = row.get('Kernel Name') or ''
+        # Trim template args / argument list for readability.
+        kname_short = kname.split('(', 1)[0].strip()
+        if not kname_short:
+            continue
+        invocation_id = row.get('ID', '')
+        metric = row.get('Metric Name', '')
+        value_str = (row.get('Metric Value') or '').replace(',', '').strip()
+        unit = (row.get('Metric Unit') or '').strip()
+        try:
+            value = float(value_str)
+        except ValueError:
+            continue
+        # Normalise duration to microseconds.
+        if metric == 'gpu__time_duration.sum':
+            if unit == 'ns':
+                value /= 1000.0
+            elif unit == 'ms':
+                value *= 1000.0
+            elif unit == 's':
+                value *= 1e6
+            elif unit != 'us':
+                continue  # unknown unit, skip
+        by_kernel[kname_short]['launch_ids'].add(invocation_id)
+        by_kernel[kname_short]['metrics'][metric].append(value)
+
+    out = {}
+    for kname, data in by_kernel.items():
+        durations = data['metrics'].get('gpu__time_duration.sum', [])
+        out[kname] = {
+            'launches': len(data['launch_ids']),
+            'duration_us_total': sum(durations),
+            'duration_us_avg': (sum(durations) / len(durations)) if durations else 0.0,
+            'metrics': {m: vals for m, vals in data['metrics'].items()},
+        }
+    return out
+
+
+def _print_ncu_summary(summary):
+    """Pretty-print the dict returned by _parse_ncu_csv."""
+    if not summary:
+        print("(ncu summary is empty)")
+        return
+    total_us = sum(v['duration_us_total'] for v in summary.values()) or 1.0
+
+    # Headline columns. Show a couple of widely-available throughput metrics
+    # if present in the CSV.
+    print(f"\n{'Kernel':<40s} {'Launches':>9s} {'Avg µs':>10s} {'Total ms':>10s} {'% time':>7s}  "
+          f"{'SM%':>6s}  {'Mem%':>6s}  {'Occ%':>6s}")
+    print("-" * 110)
+
+    def _avg(vs):
+        return sum(vs) / len(vs) if vs else float('nan')
+
+    rows = sorted(summary.items(), key=lambda kv: -kv[1]['duration_us_total'])
+    for kname, d in rows:
+        sm_pct = _avg(d['metrics'].get('sm__throughput.avg.pct_of_peak_sustained_elapsed', []))
+        mem_pct = _avg(d['metrics'].get('gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed', []))
+        occ_pct = _avg(d['metrics'].get('sm__warps_active.avg.pct_of_peak_sustained_active', []))
+
+        def _fmt(x):
+            return f"{x:>5.1f}%" if x == x else "    —"  # NaN-safe
+
+        print(f"{kname[:40]:<40s} {d['launches']:>9d} "
+              f"{d['duration_us_avg']:>10.2f} {d['duration_us_total']/1000.0:>10.3f} "
+              f"{100.0 * d['duration_us_total']/total_us:>6.1f}%  "
+              f"{_fmt(sm_pct)}  {_fmt(mem_pct)}  {_fmt(occ_pct)}")
+
+
 def _extract_ncu_stats(cfg):
-    """Extract Nsight Compute CSV results and log to wandb."""
+    """Extract Nsight Compute CSV results, summarise, and log to wandb."""
     import glob
     from hydra.core.hydra_config import HydraConfig
 
@@ -506,15 +777,34 @@ def _extract_ncu_stats(cfg):
     csv_path = candidates[0]
     print(f"\nLoading ncu results from {csv_path}...")
 
-    try:
-        import pandas as pd
-        df = pd.read_csv(csv_path)
-        print(df.to_string(index=False))
-        wandb.log({"ncu_kernel_metrics": wandb.Table(dataframe=df)})
-    except Exception as e:
-        print(f"Failed to parse ncu CSV: {e}")
-        # Upload raw file anyway
-        pass
+    summary = _parse_ncu_csv(csv_path)
+    if not summary:
+        # Either no CSV header (None) or no kernel data (empty dict). Both
+        # usually mean ncu didn't get to run kernels — most commonly the
+        # driver-side perm gate (ERR_NVGPUCTRPERM, RmProfilingAdminOnly=1).
+        with open(csv_path) as f:
+            head = "".join(line for line, _ in zip(f, range(8)))
+        if "ERR_NVGPUCTRPERM" in head:
+            print("ncu collected no kernel data: the driver requires admin perf-counter access.")
+            print("On the host, reload the nvidia module with NVreg_RestrictProfilingToAdminUsers=0,")
+            print("or run inside an environment where the driver isn't locked down.")
+        else:
+            print("ncu produced no kernel data. First lines of the report:")
+            print("\n".join("  " + line.rstrip() for line in head.splitlines() if line.strip()))
+    else:
+        _print_ncu_summary(summary)
+        # Log to wandb as a flat table.
+        try:
+            table = wandb.Table(columns=["kernel", "launches", "avg_us", "total_ms", "pct_time"])
+            total_us = sum(v['duration_us_total'] for v in summary.values()) or 1.0
+            for kname, d in sorted(summary.items(), key=lambda kv: -kv[1]['duration_us_total']):
+                table.add_data(kname, d['launches'],
+                               round(d['duration_us_avg'], 2),
+                               round(d['duration_us_total'] / 1000.0, 3),
+                               round(100.0 * d['duration_us_total'] / total_us, 1))
+            wandb.log({"ncu_kernel_summary": table})
+        except Exception as e:
+            print(f"(wandb table upload failed: {e})")
 
     artifact = wandb.Artifact(
         f"ncu-{cfg.get('kernel', {}).get('name', 'jax')}-N{cfg.sim.n_particles}",
@@ -543,6 +833,10 @@ def main(cfg: DictConfig):
     N = cfg.sim.n_particles
     G = cfg.sim.num_grids
 
+    # CUDA Graphs toggle (v6) must happen before any `import jax` in this
+    # process — including the profile=jax branch a few lines down.
+    _maybe_enable_cuda_graphs(kernel_name)
+
     # Init wandb
     wandb_cfg = OmegaConf.to_container(cfg, resolve=True)
     wandb.init(
@@ -556,7 +850,10 @@ def main(cfg: DictConfig):
     jax_trace_dir = None
     if profile_name == 'jax':
         import jax
-        jax_trace_dir = os.path.join(os.getcwd(), "jax_trace")
+        from hydra.core.hydra_config import HydraConfig
+        # Same fix as the nsys/ncu path: Hydra >=1.2 doesn't chdir.
+        run_dir = os.path.abspath(HydraConfig.get().runtime.output_dir)
+        jax_trace_dir = os.path.join(run_dir, "jax_trace")
         jax.profiler.start_trace(jax_trace_dir)
         print(f"JAX profiler started -> {jax_trace_dir}")
 
@@ -591,6 +888,30 @@ def main(cfg: DictConfig):
         visualize_frames(frames, export_path, size=[1, 1, 1], c=cfg.material.color)
     elif cfg.get('benchmark', False):
         print("\nBenchmark mode: skipping GIF rendering.")
+
+    # Dump a small results.json into the Hydra run dir so multirun callbacks
+    # (and any post-hoc aggregation) can pick up the per-run numbers without
+    # touching wandb. One file per run, fixed shape.
+    import json
+    from hydra.core.hydra_config import HydraConfig
+    run_dir = os.path.abspath(HydraConfig.get().runtime.output_dir)
+    mat_name = cfg.get('material', {}).get('elasticity', {}).get('name', None) \
+        or cfg.get('material', {}).get('name', 'unknown')
+    results = {
+        'kernel': kernel_name,
+        'material_elasticity': mat_name,
+        'n_particles': int(cfg.sim.n_particles),
+        'num_grids': int(cfg.sim.num_grids),
+        'timing_mode': cfg.get('timing_mode', 'per_frame'),
+        'num_frames': int(cfg.sim.num_frames),
+        'steps_per_frame': int(cfg.sim.steps_per_frame),
+        'total_steps': int(total_steps),
+        'elapsed_s': float(elapsed),
+        'ms_per_step': float(ms_per_step),
+        'steps_per_sec': float(steps_per_sec),
+    }
+    with open(os.path.join(run_dir, 'results.json'), 'w') as f:
+        json.dump(results, f, indent=2)
 
     # Log timing results to wandb
     log_results(kernel_name, elapsed, total_steps, summary, frame_metrics, frames, cfg, export_path)

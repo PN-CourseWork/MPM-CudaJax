@@ -147,8 +147,8 @@ def test_cuda_v1_matches_jax():
 
 
 @pytest.mark.skipif(not _kernel_available("warp"),
-                    reason="cuda_v3 (warp-reduced scatter) .so not built or no GPU")
-def test_cuda_v3_matches_jax():
+                    reason="cuda_v2 (warp-reduced scatter) .so not built or no GPU")
+def test_cuda_v2_matches_jax():
     from mpm_jax.cuda.p2g_cuda import make_cuda_p2g
 
     params, pre, post, state0, _, _, ef, pf = _build_setup()
@@ -189,8 +189,8 @@ def test_cuda_v4_matches_jax():
 
 
 @pytest.mark.skipif(not _kernel_available("fused"),
-                    reason="cuda_v2 (fused) .so not built or no GPU")
-def test_cuda_v2_matches_jax():
+                    reason="cuda_fused .so not built or no GPU")
+def test_cuda_fused_matches_jax():
     """Looser tolerances: the fused kernel does its own Jacobi SVD instead of
     cuSOLVER, so f32-noise drift in singular values feeds back through the
     stress and accumulates across substeps."""

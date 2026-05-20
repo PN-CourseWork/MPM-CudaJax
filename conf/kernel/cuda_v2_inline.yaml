@@ -1,0 +1,7 @@
+# cuda_v2_inline — same as cuda_v1_inline (inline weights + 27-stencil
+# atomic scatter, register-resident, no (N, 27, *) materialisation), with
+# __match_any_sync + __shfl_xor_sync warp reduction folded into every
+# atomicAdd. Tests whether warp coalescing helps the scatter once the
+# (N, 27, *) overhead is gone. Per-frame path only (uses the same lax.scan
+# wrapper as cuda_v1_inline). Pair with material=jelly_jacobi.
+name: cuda_v2_inline

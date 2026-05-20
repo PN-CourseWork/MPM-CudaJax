@@ -1,3 +1,4 @@
-# Fused CUDA P2G: stress + weights + compute + scatter in one kernel.
-# One thread per particle, all intermediate state in registers.
+# v2 (project plan, L2 Warp Shuffles): CUDA P2G scatter with warp-level reduction
+# (__match_any_sync + __shfl_down_sync). Reduces global atomics by collapsing
+# contributions from warp lanes targeting the same node.
 name: cuda_v2

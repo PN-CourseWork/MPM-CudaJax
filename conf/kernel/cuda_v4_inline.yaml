@@ -1,0 +1,8 @@
+# cuda_v4_inline — cell-major + 4^3 shared-memory tile + inline per-particle
+# weight/momentum computation. JAX sorts particles by home cell every substep
+# and passes (sorted x, v, C, stress, cell_start CSR) to one CUDA launch with
+# one block per grid cell. Each block aggregates contributions into a 4^3
+# smem tile before flushing to HBM with one atomicAdd per node — testing
+# whether the smem aggregation amortises away the per-particle 27-stencil
+# global atomics. Per-frame only.
+name: cuda_v4_inline
