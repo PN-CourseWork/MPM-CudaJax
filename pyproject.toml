@@ -112,6 +112,12 @@ gxx = "*"
 [tool.pixi.feature.hpc.pypi-dependencies]
 jax = { version = ">=0.4.20", extras = ["cuda12-local"] }
 warp-lang = "*"
+# cuDNN is not in NVHPC 24.1's tree on DTU's gracy, and jax[cuda12-local]
+# checks for it at initialize() time. Pull the wheel from PyPI; it
+# unpacks libcudnn.so.* into site-packages/nvidia/cudnn/lib/ and adds
+# itself to the dlopen path automatically. Removes one site-specific
+# LD_LIBRARY_PATH dance.
+nvidia-cudnn-cu12 = "*"
 
 [tool.pixi.environments]
 default = { features = ["cpu", "dev"], solve-group = "cpu" }
