@@ -14,6 +14,8 @@ dependencies = [
     "tqdm",
     "numpy",
     "wandb",
+    "warp-lang",
+    "pyvista",
 ]
 
 [tool.scikit-build]
@@ -47,6 +49,9 @@ scikit-build-core = ">=0.10"
 ninja = "*"
 seaborn = ">=0.13.2,<0.14"
 pandas = ">=3.0.3,<4"
+warp-lang = "*"
+pyvista = "*"
+imageio = "*"
 
 [tool.pixi.pypi-dependencies]
 mpm-cudajax = { path = ".", editable = true }

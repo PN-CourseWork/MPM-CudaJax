@@ -335,7 +335,8 @@ def build_jit_frame_inline(params, elasticity_fn, plasticity_fn,
             new_F = plasticity_fn(new_F)
             return MPMState(x=new_x, v=new_v, C=new_C, F=new_F), None
 
-        state, _ = jax.lax.scan(scan_body, state, None, length=steps_per_frame)
+        for _ in range(steps_per_frame):
+            state, _ = scan_body(state, None)
         return state
 
     return jit_frame
@@ -551,7 +552,8 @@ def build_jit_frame_v2_inline(params, elasticity_fn, plasticity_fn,
             new_F = plasticity_fn(new_F)
             return MPMState(x=new_x, v=new_v, C=new_C, F=new_F), None
 
-        state, _ = jax.lax.scan(scan_body, state, None, length=steps_per_frame)
+        for _ in range(steps_per_frame):
+            state, _ = scan_body(state, None)
         return state
 
     return jit_frame
@@ -621,7 +623,8 @@ def build_jit_frame_v3_inline(params, elasticity_fn, plasticity_fn,
             new_F = plasticity_fn(new_F)
             return MPMState(x=new_x, v=new_v, C=new_C, F=new_F), None
 
-        state, _ = jax.lax.scan(scan_body, state, None, length=steps_per_frame)
+        for _ in range(steps_per_frame):
+            state, _ = scan_body(state, None)
         return state
 
     return jit_frame
@@ -711,7 +714,8 @@ def build_jit_frame_v4_inline(params, elasticity_fn, plasticity_fn,
             new_F = plasticity_fn(new_F)
             return MPMState(x=new_x, v=new_v, C=new_C, F=new_F), None
 
-        state, _ = jax.lax.scan(scan_body, state, None, length=steps_per_frame)
+        for _ in range(steps_per_frame):
+            state, _ = scan_body(state, None)
         return state
 
     return jit_frame
