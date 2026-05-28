@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 from mpm_jax.cuda import p2g_cuda
 
@@ -17,10 +18,16 @@ def test_register_missing_so_returns_false(monkeypatch, tmp_path):
 
 
 def test_register_loads_prebuilt_so_and_calls_ffi(monkeypatch, tmp_path):
-    """Happy path: .so exists in _LIB_DIR, gets loaded, FFI target registered."""
+    """Fallback path: source-tree _LIB_DIR .so can still be loaded."""
     so_path = tmp_path / "libp2g_scatter.so"
     so_path.write_bytes(b"")  # only existence matters; LoadLibrary is faked
     monkeypatch.setattr(p2g_cuda, "_LIB_DIR", tmp_path)
+    monkeypatch.setattr(p2g_cuda.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(
+        p2g_cuda.resources,
+        "files",
+        lambda package: (_ for _ in ()).throw(ModuleNotFoundError),
+    )
 
     class FakeLibrary:
         P2GScatter = object()
@@ -61,6 +68,12 @@ def test_register_is_cached(monkeypatch, tmp_path):
     so_path = tmp_path / "libp2g_scatter.so"
     so_path.write_bytes(b"")
     monkeypatch.setattr(p2g_cuda, "_LIB_DIR", tmp_path)
+    monkeypatch.setattr(p2g_cuda.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(
+        p2g_cuda.resources,
+        "files",
+        lambda package: (_ for _ in ()).throw(ModuleNotFoundError),
+    )
 
     calls = []
 
@@ -80,3 +93,41 @@ def test_register_is_cached(monkeypatch, tmp_path):
     assert p2g_cuda._register(name, "libp2g_scatter.so", "P2GScatter")
     assert p2g_cuda._register(name, "libp2g_scatter.so", "P2GScatter")
     assert len(calls) == 1
+
+
+def test_register_loads_installed_artifact_when_source_tree_so_missing(
+    monkeypatch, tmp_path
+):
+    """Fallback path: scikit-build exposes the .so as an installed artifact."""
+    source_lib_dir = tmp_path / "source_lib"
+    installed_lib_dir = tmp_path / "installed_lib"
+    source_lib_dir.mkdir()
+    installed_lib_dir.mkdir()
+
+    installed_so = installed_lib_dir / "libp2g_scatter.so"
+    installed_so.write_bytes(b"")
+    monkeypatch.setattr(p2g_cuda, "_LIB_DIR", source_lib_dir)
+    monkeypatch.setattr(
+        p2g_cuda.importlib.util,
+        "find_spec",
+        lambda name: SimpleNamespace(origin=str(installed_so)),
+    )
+
+    class FakeLibrary:
+        P2GScatter = object()
+
+    loaded = {}
+
+    def fake_load_library(path):
+        loaded["path"] = path
+        return FakeLibrary()
+
+    monkeypatch.setattr(p2g_cuda.ctypes.cdll, "LoadLibrary", fake_load_library)
+    monkeypatch.setattr(p2g_cuda.jax.ffi, "pycapsule", lambda s: s)
+    monkeypatch.setattr(p2g_cuda.jax.ffi, "register_ffi_target", lambda *a, **k: None)
+    p2g_cuda._REGISTERED.clear()
+
+    assert p2g_cuda._register(
+        "unit_test_installed_artifact", "libp2g_scatter.so", "P2GScatter"
+    )
+    assert Path(loaded["path"]) == installed_so

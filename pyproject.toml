@@ -59,6 +59,12 @@ imageio = "*"
 [tool.pixi.pypi-dependencies]
 mpm-cudajax = { path = ".", editable = true }
 
+[tool.pixi.pypi-options]
+# Keep scikit-build-core editable builds tied to the Pixi environment instead
+# of a temporary isolated build env. This is required for
+# editable.rebuild=true to run incremental CMake rebuilds reliably on import.
+no-build-isolation = ["mpm-cudajax"]
+
 [tool.pixi.feature.cpu.dependencies]
 jax = ">=0.4.20"
 jaxlib = ">=0.4.20"
@@ -143,11 +149,9 @@ sim = "python simulate.py"
 sweep = "python simulate.py -cn sweep_baseline"
 sweep-quick = "python simulate.py -cn sweep_quick"
 sweep-all = "python simulate.py -cn sweep_all"
-rebuild-cuda = "pixi reinstall mpm-cudajax"
 
 [tool.pixi.feature.hpc.tasks]
 sim = "python simulate.py"
 sweep = "python simulate.py -cn sweep_baseline"
 sweep-quick = "python simulate.py -cn sweep_quick"
 sweep-all = "python simulate.py -cn sweep_all"
-rebuild-cuda = "pixi reinstall mpm-cudajax"

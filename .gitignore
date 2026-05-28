@@ -6,7 +6,8 @@ build/
 .venv/
 .pixi/
 *.egg
-mpm_jax/cuda/_lib/
+mpm_jax/cuda/_lib/*
+!mpm_jax/cuda/_lib/__init__.py
 output/
 outputs/
 .pytest_cache/

@@ -171,13 +171,12 @@ sim = "python simulate.py"
 sweep = "python simulate.py -cn sweep_baseline"
 sweep-quick = "python simulate.py -cn sweep_quick"
 sweep-all = "python simulate.py -cn sweep_all"
-rebuild-cuda = "pixi reinstall mpm-cudajax"
 ```
 
 - [ ] **Step 2: Verify task list**
 
 Run: `pixi task list`
-Expected: lists `test`, `lint`, `clean` under both envs, plus `sim`, `sweep`, `sweep-quick`, `sweep-all`, `rebuild-cuda` under `gpu` only.
+Expected: lists `test`, `lint`, `clean` under both envs, plus `sim`, `sweep`, `sweep-quick`, `sweep-all` under `gpu` only.
 
 - [ ] **Step 3: Run lint as a sanity check**
 
@@ -480,8 +479,6 @@ Key knobs:
   CPU-only dev.
 - `editable.rebuild = true` in `pyproject.toml` means edits to `.cu`
   sources trigger a rebuild on the next `import mpm_jax.cuda.p2g_cuda`.
-  Manual rebuild: `pixi run -e gpu rebuild-cuda` (which calls
-  `pixi reinstall mpm-cudajax`).
 - `[build-system].requires` pulls in `scikit-build-core>=0.10`,
   `cmake>=3.24`, and `jax>=0.4.20` (jax is needed at build time so CMake
   can `import jax.ffi` to find the FFI headers).

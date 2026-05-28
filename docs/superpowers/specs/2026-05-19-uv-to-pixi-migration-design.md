@@ -97,7 +97,6 @@ sim = "python simulate.py"
 sweep = "python simulate.py -cn sweep_baseline"
 sweep-quick = "python simulate.py -cn sweep_quick"
 sweep-all = "python simulate.py -cn sweep_all"
-rebuild-cuda = "pixi reinstall mpm-cudajax"
 ```
 
 `pixi run <task>` resolves to the right env automatically; GPU-feature tasks only exist in the `gpu` env.

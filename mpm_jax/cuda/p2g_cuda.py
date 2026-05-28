@@ -1,15 +1,17 @@
 """CUDA P2G kernels, integrated via JAX FFI.
 
 The .so files are built at install time by scikit-build-core + CMake (see
-CMakeLists.txt) and shipped inside ``mpm_jax/cuda/_lib/``. Run
-``pixi install -e gpu`` to (re)build; with ``editable.rebuild=true`` in
-pyproject.toml, edits to the .cu sources also trigger a rebuild on import.
+CMakeLists.txt) and shipped inside ``mpm_jax/cuda/_lib/``. In editable Pixi
+environments, ``editable.rebuild=true`` lets scikit-build-core incrementally
+rebuild changed CUDA sources when the packaged artifact is resolved.
 
 Override the CUDA architecture at build time with ``MPM_CUDA_ARCH=sm_86``
 (default: ``native``).
 """
 
 import ctypes
+import importlib.resources as resources
+import importlib.util
 import logging
 from pathlib import Path
 from threading import Lock
@@ -30,17 +32,54 @@ def _shared_library_path(so_name: str) -> Path:
     return _LIB_DIR / so_name
 
 
+def _shared_library_candidates(so_name: str) -> list[Path]:
+    """Return plausible locations for a packaged CUDA shared library.
+
+    Prefer Python's package/artifact lookup so scikit-build-core's editable
+    rebuild hook can run when CUDA sources changed. The source-tree ``_lib``
+    path is only a fallback for older installs or direct in-tree builds.
+    """
+    # Ask Python's import machinery for the installed artifact. In editable
+    # scikit-build-core installs, this triggers the native editable rebuild
+    # hook for known wheel files when needed and gives us the built .so path.
+    candidates = []
+    module_name = Path(so_name).stem
+    try:
+        spec = importlib.util.find_spec(f"mpm_jax.cuda._lib.{module_name}")
+    except Exception:
+        spec = None
+    if spec is not None and spec.origin:
+        candidates.append(Path(spec.origin))
+
+    try:
+        resource_path = resources.files("mpm_jax.cuda._lib").joinpath(so_name)
+        candidates.append(Path(str(resource_path)))
+    except (ModuleNotFoundError, FileNotFoundError):
+        pass
+
+    candidates.append(_shared_library_path(so_name))
+
+    return candidates
+
+
+def _find_shared_library(so_name: str) -> Path | None:
+    for candidate in _shared_library_candidates(so_name):
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _register(name: str, so_name: str, symbol: str) -> bool:
     """Load .so from the package's _lib/ dir and register the FFI target."""
     with _REGISTER_LOCK:
         if name in _REGISTERED:
             return _REGISTERED[name]
 
-        so_path = _shared_library_path(so_name)
-        if not so_path.exists():
+        so_path = _find_shared_library(so_name)
+        if so_path is None:
             logger.warning(
-                "CUDA kernel %s not built. Run `pixi install -e gpu` "
-                "in an environment where nvcc is on PATH.",
+                "CUDA kernel %s not found in package resources. Run "
+                "`pixi install -e gpu` in an environment where nvcc is on PATH.",
                 so_name,
             )
             _REGISTERED[name] = False
