@@ -191,3 +191,41 @@ def build_jit_stages_scan(params, elasticity_fn, plasticity_fn,
         return MPMState(x=new_x, v=new_v, C=new_C, F=new_F)
 
     return jit_p2g_stage, jit_grid_stage, jit_g2p_stage
+
+
+def build_jit_frame_scan(params, elasticity_fn, plasticity_fn,
+                         pre_particle_fn, post_grid_fn, steps_per_frame):
+    """Build one fully-JIT'd frame using scan-over-27-stencils P2G."""
+
+    @jax.jit
+    def jit_frame(state):
+        def scan_body(state, _):
+            with jax.named_scope("pre_particle"):
+                x, v = pre_particle_fn(state.x, state.v, 0.0)
+            with jax.named_scope("elasticity"):
+                stress = elasticity_fn(state.F)
+            with jax.named_scope("p2g_scan"):
+                grid_mv, grid_m = _p2g_scan(
+                    x, v, state.C, stress,
+                    params.dt, params.vol, params.p_mass,
+                    params.dx, params.inv_dx, params.num_grids,
+                )
+            with jax.named_scope("grid_update"):
+                grid_mv_normalized = grid_update(
+                    grid_mv, grid_m, params.gravity, params.dt, params.damping)
+                grid_v = post_grid_fn(grid_mv_normalized, grid_m, 0.0)
+            with jax.named_scope("g2p"):
+                weight, dweight, dpos, index = compute_weights_and_indices(
+                    x, params.inv_dx, params.dx, params.num_grids)
+                new_x, new_v, new_C, new_F = g2p(
+                    grid_v, weight, dweight, dpos, index,
+                    state.F, x, params.dt, params.inv_dx, params.clip_bound)
+            with jax.named_scope("plasticity"):
+                new_F = plasticity_fn(new_F)
+            return MPMState(x=new_x, v=new_v, C=new_C, F=new_F), None
+
+        for _ in range(steps_per_frame):
+            state, _ = scan_body(state, None)
+        return state
+
+    return jit_frame

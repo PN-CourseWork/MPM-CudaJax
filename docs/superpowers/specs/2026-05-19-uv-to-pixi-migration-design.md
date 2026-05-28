@@ -87,7 +87,7 @@ lint = "ruff check ."
 clean = """
 rm -f mpm_jax/cuda/_lib/*.so mpm_jax/cuda/kernels/*.so && \
 rm -rf build/ multirun/ outputs/ output/ && \
-rm -f *.nsys-rep *.sqlite && \
+rm -f *.sqlite && \
 find . -type d -name __pycache__ -exec rm -rf {} +
 """
 

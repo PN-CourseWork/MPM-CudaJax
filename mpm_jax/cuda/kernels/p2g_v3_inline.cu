@@ -11,7 +11,7 @@
 // warp lanes hit the same stencil cell and the number of global atomics
 // drops dramatically.
 //
-// Helper warp_reduce_masked is cribbed from p2g_scatter_warp.cu.
+// Helper warp_reduce_masked coalesces matching stencil targets inside a warp.
 //
 // Inputs (all float32):
 //   x:      (N, 3)        particle positions          (assumed sorted)
@@ -33,7 +33,7 @@
 namespace ffi = xla::ffi;
 
 // ---------------------------------------------------------------------------
-// Warp-level masked reduction (copied from p2g_scatter_warp.cu).
+// Warp-level masked reduction for particles that target the same grid node.
 // Reduce `val` across all lanes in `mask` using butterfly shuffle. Returns
 // the sum in ALL lanes of the group (not just the leader).
 // ---------------------------------------------------------------------------

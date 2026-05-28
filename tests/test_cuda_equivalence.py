@@ -1,4 +1,4 @@
-"""Each CUDA P2G variant must produce results numerically equivalent to the
+"""Lower-level CUDA paths must produce results numerically equivalent to the
 JAX baseline.
 
 Strategy: build the per-stage stage functions for both JAX and the CUDA
@@ -7,11 +7,7 @@ state, then assert the final particle state matches.
 
 Tolerances reflect the source of expected drift:
 
-  v1, v3, v4 — only the scatter is different from JAX. ``atomicAdd`` is
-      associative-ish but not order-deterministic on floats, so per-substep
-      drift is tiny and bounded; we use atol=1e-4 on positions / 5e-3 on
-      velocities after 20 substeps.
-  v2 — the entire P2G stage (SVD + stress + APIC + scatter) is replaced by
+  fused — the entire P2G stage (SVD + stress + APIC + scatter) is replaced by
       a single fused CUDA kernel that does its own Jacobi SVD instead of
       cuSOLVER. SVD outputs differ at f32 noise, which feeds back into
       stress and accumulates through the timestep. We use atol=1e-3 on
@@ -117,75 +113,7 @@ def _assert_states_close(s_jax, s_cuda, *, atol_x, atol_v, atol_F):
     )
 
 
-# Common scatter-only tolerance for v1/v3/v4: only the atomicAdd order
-# differs from XLA's scatter.
-_SCATTER_ATOL_X = 1e-4
-_SCATTER_ATOL_V = 5e-3
-_SCATTER_ATOL_F = 1e-4
 _N_SUBSTEPS = 20
-
-
-@pytest.mark.skipif(not _kernel_available("scatter"),
-                    reason="cuda_v1 (naive scatter) .so not built or no GPU")
-def test_cuda_v1_matches_jax():
-    from mpm_jax.cuda.p2g_cuda import make_cuda_p2g
-
-    params, pre, post, state0, _, _, ef, pf = _build_setup()
-    s_jax = _run_stages(build_jit_stages(params, ef, pf, pre, post), state0, _N_SUBSTEPS)
-
-    cuda_p2g = make_cuda_p2g(num_grids=16, kernel="scatter")
-    assert cuda_p2g is not None, "cuda_v1 kernel was reported available but factory returned None"
-    s_cuda = _run_stages(
-        build_jit_stages(params, ef, pf, pre, post, p2g_fn=cuda_p2g),
-        state0, _N_SUBSTEPS,
-    )
-
-    _assert_states_close(s_jax, s_cuda,
-                         atol_x=_SCATTER_ATOL_X,
-                         atol_v=_SCATTER_ATOL_V,
-                         atol_F=_SCATTER_ATOL_F)
-
-
-@pytest.mark.skipif(not _kernel_available("warp"),
-                    reason="cuda_v2 (warp-reduced scatter) .so not built or no GPU")
-def test_cuda_v2_matches_jax():
-    from mpm_jax.cuda.p2g_cuda import make_cuda_p2g
-
-    params, pre, post, state0, _, _, ef, pf = _build_setup()
-    s_jax = _run_stages(build_jit_stages(params, ef, pf, pre, post), state0, _N_SUBSTEPS)
-
-    cuda_p2g = make_cuda_p2g(num_grids=16, kernel="warp")
-    assert cuda_p2g is not None
-    s_cuda = _run_stages(
-        build_jit_stages(params, ef, pf, pre, post, p2g_fn=cuda_p2g),
-        state0, _N_SUBSTEPS,
-    )
-
-    _assert_states_close(s_jax, s_cuda,
-                         atol_x=_SCATTER_ATOL_X,
-                         atol_v=_SCATTER_ATOL_V,
-                         atol_F=_SCATTER_ATOL_F)
-
-
-@pytest.mark.skipif(not _kernel_available("smem"),
-                    reason="cuda_v4 (smem-staged scatter) .so not built or no GPU")
-def test_cuda_v4_matches_jax():
-    from mpm_jax.cuda.p2g_cuda import make_cuda_p2g
-
-    params, pre, post, state0, _, _, ef, pf = _build_setup()
-    s_jax = _run_stages(build_jit_stages(params, ef, pf, pre, post), state0, _N_SUBSTEPS)
-
-    cuda_p2g = make_cuda_p2g(num_grids=16, kernel="smem")
-    assert cuda_p2g is not None
-    s_cuda = _run_stages(
-        build_jit_stages(params, ef, pf, pre, post, p2g_fn=cuda_p2g),
-        state0, _N_SUBSTEPS,
-    )
-
-    _assert_states_close(s_jax, s_cuda,
-                         atol_x=_SCATTER_ATOL_X,
-                         atol_v=_SCATTER_ATOL_V,
-                         atol_F=_SCATTER_ATOL_F)
 
 
 @pytest.mark.skipif(not _kernel_available("fused"),

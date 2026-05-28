@@ -163,7 +163,7 @@ Append to `pyproject.toml`:
 [tool.pixi.tasks]
 test = "pytest tests/ -v"
 lint = "ruff check ."
-clean = { cmd = "rm -f mpm_jax/cuda/_lib/*.so mpm_jax/cuda/kernels/*.so && rm -rf build multirun outputs output && rm -f *.nsys-rep *.sqlite && find . -type d -name __pycache__ -exec rm -rf {} +" }
+clean = { cmd = "rm -f mpm_jax/cuda/_lib/*.so mpm_jax/cuda/kernels/*.so && rm -rf build multirun outputs output && rm -f *.sqlite && find . -type d -name __pycache__ -exec rm -rf {} +" }
 
 [tool.pixi.feature.gpu.tasks]
 sim = "python simulate.py"
@@ -320,13 +320,13 @@ the custom CUDA kernels via CMake — `nvcc` and `gxx` come from
 conda-forge, no system module load needed):
 ```bash
 pixi install -e gpu
-pixi run -e gpu python simulate.py kernel=cuda_v2 timing_mode=per_stage
+pixi run -e gpu python simulate.py kernel=cuda_v2
 ```
 
 To benchmark instead of rendering:
 ```bash
 pixi run -e gpu python simulate.py \
-    kernel=cuda_v2 timing_mode=per_stage \
+    kernel=cuda_v2 \
     sim.n_particles=500000 sim.num_grids=64 sim.num_frames=15 \
     benchmark=true
 ```
@@ -529,13 +529,13 @@ to:
 And change the bullet:
 
 ```
-- Don't commit `build/`, `output/`, `outputs/`, `multirun/`, `*.nsys-rep`, `*.sqlite`, or `uv.lock` (`.gitignore` covers these).
+- Don't commit `build/`, `output/`, `outputs/`, `multirun/`, `*.sqlite`, or `uv.lock` (`.gitignore` covers these).
 ```
 
 to:
 
 ```
-- Don't commit `build/`, `output/`, `outputs/`, `multirun/`, `*.nsys-rep`, `*.sqlite`, or `.pixi/` (`.gitignore` covers these). DO commit `pixi.lock`.
+- Don't commit `build/`, `output/`, `outputs/`, `multirun/`, `*.sqlite`, or `.pixi/` (`.gitignore` covers these). DO commit `pixi.lock`.
 ```
 
 - [ ] **Step 4: Verify no `uv` references remain**

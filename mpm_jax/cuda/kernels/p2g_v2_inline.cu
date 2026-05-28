@@ -23,7 +23,7 @@
 namespace ffi = xla::ffi;
 
 // ---------------------------------------------------------------------------
-// Warp-level reduction helper (same as p2g_scatter_warp.cu).
+// Warp-level reduction helper for coalescing matching stencil targets.
 // ---------------------------------------------------------------------------
 
 // Reduce `val` across all lanes in `mask` using butterfly shuffle.

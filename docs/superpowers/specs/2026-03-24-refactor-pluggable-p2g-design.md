@@ -315,7 +315,7 @@ Material, sim configs unchanged. Profile configs removed (timing is now built-in
 - JAX FFI integration (`jax.ffi.register_ffi_target`) — replaced by `cuda.core`
 - Shared-memory kernel (v4 / `p2g_scatter_smem.cu`) — dropped
 - `StageTimer` class — replaced by simple `time.perf_counter()` diffs
-- Nsys/ncu profiler integration in simulate.py — can still be used externally
+- External profiler integration can be used outside simulate.py when needed
 
 ## What's Kept
 

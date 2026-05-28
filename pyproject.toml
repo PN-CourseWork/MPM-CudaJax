@@ -86,13 +86,6 @@ warp-lang = "*"
 [tool.pixi.feature.gpu.system-requirements]
 cuda = "12.0"
 
-# Nsight profilers (nsys / ncu) for `simulate.py profile=nsys|ncu` are
-# NOT shipped via conda — NVIDIA doesn't publish `nsight-systems` on
-# conda-forge or the nvidia channel. Install them system-wide on the
-# benchmark host:
-#     sudo apt-get install nsight-systems nsight-compute
-# Both end up on PATH and `simulate.py` picks them up from there.
-
 # HPC / module-system environment. Unlike `gpu` (which bundles a full
 # conda-forge CUDA 12 stack), `hpc` brings NO CUDA libs of its own and
 # instead relies on a site-provided CUDA toolkit loaded via `module load`
@@ -106,7 +99,6 @@ cuda = "12.0"
 #     module load nvhpc/24.1            # provides nvcc + libcuda matched to driver
 #     pixi install -e hpc               # builds .cu kernels with module's nvcc
 #     pixi run -e hpc python simulate.py ...
-# Same module's `ncu` is on PATH, so `profile=ncu` also works.
 [tool.pixi.feature.hpc]
 platforms = ["linux-64", "linux-aarch64"]
 
@@ -131,12 +123,12 @@ hpc = { features = ["hpc", "dev"], solve-group = "hpc" }
 [tool.pixi.tasks]
 test = "pytest tests/ -v"
 lint = "ruff check ."
-clean = { cmd = "rm -f mpm_jax/cuda/_lib/*.so mpm_jax/cuda/kernels/*.so && rm -rf build multirun outputs output && rm -f *.nsys-rep *.sqlite && find . -type d -name __pycache__ -exec rm -rf {} +" }
+clean = { cmd = "rm -f mpm_jax/cuda/_lib/*.so mpm_jax/cuda/kernels/*.so && rm -rf build multirun outputs output && rm -f *.sqlite && find . -type d -name __pycache__ -exec rm -rf {} +" }
 
 # Push the working tree to a remote host (e.g. `pixi run sync lambda`).
 # Excludes generated dirs (.pixi, build, outputs, etc.) and arch-specific
 # CUDA .so files — the remote rebuilds those on its own `pixi install -e gpu`.
-sync = { args = [{ arg = "host" }], cmd = "rsync -ahz --info=stats1,name0 --exclude=.pixi --exclude=.venv --exclude=build --exclude=outputs --exclude=multirun --exclude=output --exclude=mpm_jax/cuda/_lib --exclude=__pycache__ --exclude='*.nsys-rep' --exclude='*.sqlite' --exclude='*.egg-info' --exclude=.pytest_cache ./ {{ host }}:~/MPM-CudaJax/" }
+sync = { args = [{ arg = "host" }], cmd = "rsync -ahz --info=stats1,name0 --exclude=.pixi --exclude=.venv --exclude=build --exclude=outputs --exclude=multirun --exclude=output --exclude=mpm_jax/cuda/_lib --exclude=__pycache__ --exclude='*.sqlite' --exclude='*.egg-info' --exclude=.pytest_cache ./ {{ host }}:~/MPM-CudaJax/" }
 
 # Pull Hydra run outputs back from a remote host (e.g. `pixi run sync-results lambda`).
 # One rsync with include/exclude rules so missing source dirs are silently skipped.

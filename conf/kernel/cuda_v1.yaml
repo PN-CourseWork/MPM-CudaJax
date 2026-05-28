@@ -1,3 +1,0 @@
-# Naive CUDA P2G scatter: one thread per particle, global atomicAdd.
-# The per-particle compute (stress, weights) stays in JAX.
-name: cuda_v1

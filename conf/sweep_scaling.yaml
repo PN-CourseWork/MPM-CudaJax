@@ -6,9 +6,7 @@
 # Usage:
 #   pixi run -e gpu python simulate.py -cn sweep_scaling
 #
-# All four variants share material=jelly_jacobi (Jacobi SVD in JAX) +
-# per_frame timing. cuda_fused (which needs per_stage + material=jelly)
-# is not included here — run it separately and merge the CSVs if needed.
+# All four variants share material=jelly_jacobi (Jacobi SVD in JAX).
 
 defaults:
   - config
@@ -20,7 +18,7 @@ hydra:
   sweeper:
     params:
       sim.n_particles: 50000,200000,500000,1000000,5000000
-      kernel: jax,cuda_v1_inline,cuda_v2_inline,cuda_v3_inline
+      kernel: jax,warp_v1_inline,cuda_v1_inline,cuda_v2_inline,cuda_v3_inline
   callbacks:
     scaling_plot:
       _target_: mpm_jax.callbacks.ScalingPlotCallback
@@ -28,7 +26,6 @@ hydra:
 
 benchmark: true
 tag: scaling_sweep
-timing_mode: per_frame
 sim:
   num_frames: 10
   num_grids: 64

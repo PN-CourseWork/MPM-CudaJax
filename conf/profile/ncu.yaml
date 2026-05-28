@@ -1,4 +1,0 @@
-# Nsight Compute — per-kernel metrics: occupancy, bandwidth, warp stalls.
-# Very slow (replays kernels). Use with few frames (sim.num_frames=1).
-# Re-launches the process under ncu automatically.
-name: ncu

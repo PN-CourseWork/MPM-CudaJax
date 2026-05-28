@@ -1,8 +1,6 @@
-# Profile sweep: all kernels × all profilers.
+# Profile sweep: all kernels with the JAX profiler.
 # Usage: pixi run -e gpu python simulate.py -cn sweep_profile
 #
-# Runs each kernel with nsys, ncu, and jax profiler.
-# Uses small problem size since ncu is very slow.
 defaults:
   - config
   - _self_
@@ -11,8 +9,8 @@ hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      kernel: jax,cuda_v1,cuda_v2
-      profile: nsys,ncu,jax
+      kernel: jax,jax_v1_5,warp_v1_inline,cuda_v2_inline,cuda_v3_inline,cuda_v6_inline
+      profile: jax
 
 benchmark: true
 tag: profile

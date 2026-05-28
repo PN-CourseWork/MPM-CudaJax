@@ -1,0 +1,3 @@
+# warp_v1_inline — inline P2G implemented as an NVIDIA Warp kernel and called
+# from inside JAX JIT through warp.jax_experimental.jax_kernel.
+name: warp_v1_inline

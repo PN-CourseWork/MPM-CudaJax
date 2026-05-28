@@ -102,18 +102,6 @@ def _register(name: str, so_name: str, symbol: str) -> bool:
             return False
 
 
-def _register_scatter():
-    return _register("p2g_scatter_cuda", "libp2g_scatter.so", "P2GScatter")
-
-
-def _register_warp():
-    return _register("p2g_scatter_warp_cuda", "libp2g_scatter_warp.so", "P2GScatterWarp")
-
-
-def _register_smem():
-    return _register("p2g_scatter_smem_cuda", "libp2g_scatter_smem.so", "P2GScatterSmem")
-
-
 def _register_fused():
     return _register("p2g_fused_cuda", "libp2g_fused.so", "P2GFused")
 
@@ -136,74 +124,6 @@ def _register_v3_inline():
 
 def _register_v4_inline():
     return _register("p2g_v4_inline_cuda", "libp2g_v4_inline.so", "P2GV4Inline")
-
-
-def cuda_p2g_scatter(mv, m, index, num_grids):
-    """CUDA P2G scatter via JAX FFI.
-
-    Drop-in replacement for solver.p2g_scatter().
-    """
-    G3 = num_grids ** 3
-    index = index.astype(jnp.int32)
-
-    grid_mv, grid_m = jax.ffi.ffi_call(
-        "p2g_scatter_cuda",
-        (
-            jax.ShapeDtypeStruct((G3, 3), jnp.float32),
-            jax.ShapeDtypeStruct((G3,), jnp.float32),
-        ),
-        vmap_method="broadcast_all",
-    )(mv, m, index)
-
-    return grid_mv, grid_m
-
-
-def cuda_p2g_scatter_warp(mv, m, index, num_grids):
-    """CUDA P2G scatter with warp-level reduction via JAX FFI."""
-    G3 = num_grids ** 3
-    index = index.astype(jnp.int32)
-
-    grid_mv, grid_m = jax.ffi.ffi_call(
-        "p2g_scatter_warp_cuda",
-        (
-            jax.ShapeDtypeStruct((G3, 3), jnp.float32),
-            jax.ShapeDtypeStruct((G3,), jnp.float32),
-        ),
-        vmap_method="broadcast_all",
-    )(mv, m, index)
-
-    return grid_mv, grid_m
-
-
-def cuda_p2g_scatter_smem(mv, m, index, num_grids):
-    """CUDA P2G scatter with shared-memory tile staging via JAX FFI."""
-    G = num_grids
-    G3 = G ** 3
-
-    index_i32 = index.astype(jnp.int32)
-
-    # Sort particles by their home cell (center stencil node = offset 13)
-    cell_id = index_i32[:, 13]
-    order = jnp.argsort(cell_id)
-
-    mv_sorted = mv[order]
-    m_sorted = m[order]
-    index_sorted = index_i32[order]
-
-    cell_id_sorted = cell_id[order]
-    cell_boundaries = jnp.arange(G3 + 1, dtype=jnp.int32)
-    cell_start = jnp.searchsorted(cell_id_sorted, cell_boundaries).astype(jnp.int32)
-
-    grid_mv, grid_m = jax.ffi.ffi_call(
-        "p2g_scatter_smem_cuda",
-        (
-            jax.ShapeDtypeStruct((G3, 3), jnp.float32),
-            jax.ShapeDtypeStruct((G3,), jnp.float32),
-        ),
-        vmap_method="broadcast_all",
-    )(mv_sorted, m_sorted, index_sorted, cell_start)
-
-    return grid_mv, grid_m
 
 
 def cuda_p2g_fused(x, v, C, F, num_grids, dt, vol, p_mass, inv_dx, dx,
@@ -247,15 +167,9 @@ def cuda_p2g_fused(x, v, C, F, num_grids, dt, vol, p_mass, inv_dx, dx,
     return grid_mv, grid_m, F_out_flat.reshape(N, 3, 3)
 
 
-def is_available(kernel='scatter'):
+def is_available(kernel='inline'):
     """Check if a prebuilt CUDA kernel can be loaded and registered."""
-    if kernel == 'scatter':
-        return _register_scatter()
-    elif kernel == 'warp':
-        return _register_warp()
-    elif kernel == 'smem':
-        return _register_smem()
-    elif kernel == 'fused':
+    if kernel == 'fused':
         return _register_fused()
     elif kernel == 'g2p_fused':
         return _register_g2p_fused()
@@ -344,34 +258,40 @@ def build_jit_frame_inline(params, elasticity_fn, plasticity_fn,
     @jax.jit
     def jit_frame(state):
         def scan_body(state, _):
-            x, v = pre_particle_fn(state.x, state.v, 0.0)
-            stress = elasticity_fn(state.F)
-            grid_mv, grid_m = cuda_p2g_inline(
-                x, v, state.C, stress,
-                params.num_grids, params.dt, params.vol, params.p_mass,
-                params.inv_dx, params.dx,
-            )
-            grid_mv = grid_update_fn(
-                grid_mv, grid_m, params.gravity, params.dt, params.damping)
-            grid_v = post_grid_fn(grid_mv, grid_m, 0.0)
-
-            if use_cuda_g2p:
-                # CUDA G2P: gather + grad_v + state update, register-resident
-                # 27-loop. No (N, 27, *) tensors anywhere in this substep.
-                new_x, new_v, new_C, new_F = cuda_g2p_fused(
-                    x, state.F, grid_v,
-                    params.num_grids, params.dt,
-                    params.inv_dx, params.dx, params.clip_bound,
+            with jax.named_scope("pre_particle"):
+                x, v = pre_particle_fn(state.x, state.v, 0.0)
+            with jax.named_scope("elasticity"):
+                stress = elasticity_fn(state.F)
+            with jax.named_scope("p2g_inline"):
+                grid_mv, grid_m = cuda_p2g_inline(
+                    x, v, state.C, stress,
+                    params.num_grids, params.dt, params.vol, params.p_mass,
+                    params.inv_dx, params.dx,
                 )
-            else:
-                # JAX G2P (materialises (N, 27, *) weights for the gather).
-                weight, dweight, dpos, index = compute_weights_and_indices(
-                    x, params.inv_dx, params.dx, params.num_grids)
-                new_x, new_v, new_C, new_F = g2p(
-                    grid_v, weight, dweight, dpos, index,
-                    state.F, x, params.dt, params.inv_dx, params.clip_bound)
+            with jax.named_scope("grid_update"):
+                grid_mv = grid_update_fn(
+                    grid_mv, grid_m, params.gravity, params.dt, params.damping)
+                grid_v = post_grid_fn(grid_mv, grid_m, 0.0)
 
-            new_F = plasticity_fn(new_F)
+            with jax.named_scope("g2p"):
+                if use_cuda_g2p:
+                    # CUDA G2P: gather + grad_v + state update, register-resident
+                    # 27-loop. No (N, 27, *) tensors anywhere in this substep.
+                    new_x, new_v, new_C, new_F = cuda_g2p_fused(
+                        x, state.F, grid_v,
+                        params.num_grids, params.dt,
+                        params.inv_dx, params.dx, params.clip_bound,
+                    )
+                else:
+                    # JAX G2P (materialises (N, 27, *) weights for the gather).
+                    weight, dweight, dpos, index = compute_weights_and_indices(
+                        x, params.inv_dx, params.dx, params.num_grids)
+                    new_x, new_v, new_C, new_F = g2p(
+                        grid_v, weight, dweight, dpos, index,
+                        state.F, x, params.dt, params.inv_dx, params.clip_bound)
+
+            with jax.named_scope("plasticity"):
+                new_F = plasticity_fn(new_F)
             return MPMState(x=new_x, v=new_v, C=new_C, F=new_F), None
 
         for _ in range(steps_per_frame):
@@ -564,31 +484,37 @@ def build_jit_frame_v2_inline(params, elasticity_fn, plasticity_fn,
     @jax.jit
     def jit_frame(state):
         def scan_body(state, _):
-            x, v = pre_particle_fn(state.x, state.v, 0.0)
-            stress = elasticity_fn(state.F)
-            grid_mv, grid_m = cuda_p2g_v2_inline(
-                x, v, state.C, stress,
-                params.num_grids, params.dt, params.vol, params.p_mass,
-                params.inv_dx, params.dx,
-            )
-            grid_mv = grid_update_fn(
-                grid_mv, grid_m, params.gravity, params.dt, params.damping)
-            grid_v = post_grid_fn(grid_mv, grid_m, 0.0)
-
-            if use_cuda_g2p:
-                new_x, new_v, new_C, new_F = cuda_g2p_fused(
-                    x, state.F, grid_v,
-                    params.num_grids, params.dt,
-                    params.inv_dx, params.dx, params.clip_bound,
+            with jax.named_scope("pre_particle"):
+                x, v = pre_particle_fn(state.x, state.v, 0.0)
+            with jax.named_scope("elasticity"):
+                stress = elasticity_fn(state.F)
+            with jax.named_scope("p2g_v2_inline"):
+                grid_mv, grid_m = cuda_p2g_v2_inline(
+                    x, v, state.C, stress,
+                    params.num_grids, params.dt, params.vol, params.p_mass,
+                    params.inv_dx, params.dx,
                 )
-            else:
-                weight, dweight, dpos, index = compute_weights_and_indices(
-                    x, params.inv_dx, params.dx, params.num_grids)
-                new_x, new_v, new_C, new_F = g2p(
-                    grid_v, weight, dweight, dpos, index,
-                    state.F, x, params.dt, params.inv_dx, params.clip_bound)
+            with jax.named_scope("grid_update"):
+                grid_mv = grid_update_fn(
+                    grid_mv, grid_m, params.gravity, params.dt, params.damping)
+                grid_v = post_grid_fn(grid_mv, grid_m, 0.0)
 
-            new_F = plasticity_fn(new_F)
+            with jax.named_scope("g2p"):
+                if use_cuda_g2p:
+                    new_x, new_v, new_C, new_F = cuda_g2p_fused(
+                        x, state.F, grid_v,
+                        params.num_grids, params.dt,
+                        params.inv_dx, params.dx, params.clip_bound,
+                    )
+                else:
+                    weight, dweight, dpos, index = compute_weights_and_indices(
+                        x, params.inv_dx, params.dx, params.num_grids)
+                    new_x, new_v, new_C, new_F = g2p(
+                        grid_v, weight, dweight, dpos, index,
+                        state.F, x, params.dt, params.inv_dx, params.clip_bound)
+
+            with jax.named_scope("plasticity"):
+                new_F = plasticity_fn(new_F)
             return MPMState(x=new_x, v=new_v, C=new_C, F=new_F), None
 
         for _ in range(steps_per_frame):
@@ -629,37 +555,44 @@ def build_jit_frame_v3_inline(params, elasticity_fn, plasticity_fn,
     @jax.jit
     def jit_frame(state):
         def scan_body(state, _):
-            order = morton_argsort(state.x, params.inv_dx, params.num_grids)
-            x_sorted = state.x[order]
-            v_sorted = state.v[order]
-            C_sorted = state.C[order]
-            F_sorted = state.F[order]
+            with jax.named_scope("morton_sort"):
+                order = morton_argsort(state.x, params.inv_dx, params.num_grids)
+                x_sorted = state.x[order]
+                v_sorted = state.v[order]
+                C_sorted = state.C[order]
+                F_sorted = state.F[order]
 
-            x, v = pre_particle_fn(x_sorted, v_sorted, 0.0)
-            stress = elasticity_fn(F_sorted)
-            grid_mv, grid_m = cuda_p2g_v3_inline(
-                x, v, C_sorted, stress,
-                params.num_grids, params.dt, params.vol, params.p_mass,
-                params.inv_dx, params.dx,
-            )
-            grid_mv = grid_update_fn(
-                grid_mv, grid_m, params.gravity, params.dt, params.damping)
-            grid_v = post_grid_fn(grid_mv, grid_m, 0.0)
-
-            if use_cuda_g2p:
-                new_x, new_v, new_C, new_F = cuda_g2p_fused(
-                    x, F_sorted, grid_v,
-                    params.num_grids, params.dt,
-                    params.inv_dx, params.dx, params.clip_bound,
+            with jax.named_scope("pre_particle"):
+                x, v = pre_particle_fn(x_sorted, v_sorted, 0.0)
+            with jax.named_scope("elasticity"):
+                stress = elasticity_fn(F_sorted)
+            with jax.named_scope("p2g_v3_inline"):
+                grid_mv, grid_m = cuda_p2g_v3_inline(
+                    x, v, C_sorted, stress,
+                    params.num_grids, params.dt, params.vol, params.p_mass,
+                    params.inv_dx, params.dx,
                 )
-            else:
-                weight, dweight, dpos, index = compute_weights_and_indices(
-                    x, params.inv_dx, params.dx, params.num_grids)
-                new_x, new_v, new_C, new_F = g2p(
-                    grid_v, weight, dweight, dpos, index,
-                    F_sorted, x, params.dt, params.inv_dx, params.clip_bound)
+            with jax.named_scope("grid_update"):
+                grid_mv = grid_update_fn(
+                    grid_mv, grid_m, params.gravity, params.dt, params.damping)
+                grid_v = post_grid_fn(grid_mv, grid_m, 0.0)
 
-            new_F = plasticity_fn(new_F)
+            with jax.named_scope("g2p"):
+                if use_cuda_g2p:
+                    new_x, new_v, new_C, new_F = cuda_g2p_fused(
+                        x, F_sorted, grid_v,
+                        params.num_grids, params.dt,
+                        params.inv_dx, params.dx, params.clip_bound,
+                    )
+                else:
+                    weight, dweight, dpos, index = compute_weights_and_indices(
+                        x, params.inv_dx, params.dx, params.num_grids)
+                    new_x, new_v, new_C, new_F = g2p(
+                        grid_v, weight, dweight, dpos, index,
+                        F_sorted, x, params.dt, params.inv_dx, params.clip_bound)
+
+            with jax.named_scope("plasticity"):
+                new_F = plasticity_fn(new_F)
             return MPMState(x=new_x, v=new_v, C=new_C, F=new_F), None
 
         for _ in range(steps_per_frame):
@@ -710,47 +643,54 @@ def build_jit_frame_v4_inline(params, elasticity_fn, plasticity_fn,
     @jax.jit
     def jit_frame(state):
         def scan_body(state, _):
-            x, v = pre_particle_fn(state.x, state.v, 0.0)
-            stress = elasticity_fn(state.F)
+            with jax.named_scope("pre_particle"):
+                x, v = pre_particle_fn(state.x, state.v, 0.0)
+            with jax.named_scope("elasticity"):
+                stress = elasticity_fn(state.F)
 
-            super_id = _home_super_cell_id(x, params.inv_dx, G, sc)
-            order = jnp.argsort(super_id)
+            with jax.named_scope("super_cell_sort"):
+                super_id = _home_super_cell_id(x, params.inv_dx, G, sc)
+                order = jnp.argsort(super_id)
 
-            x_s = x[order]
-            v_s = v[order]
-            C_s = state.C[order]
-            stress_s = stress[order]
-            F_s = state.F[order]
+                x_s = x[order]
+                v_s = v[order]
+                C_s = state.C[order]
+                stress_s = stress[order]
+                F_s = state.F[order]
 
-            super_id_sorted = super_id[order]
-            cell_start = jnp.searchsorted(
-                super_id_sorted, super_boundaries
-            ).astype(jnp.int32)
+                super_id_sorted = super_id[order]
+                cell_start = jnp.searchsorted(
+                    super_id_sorted, super_boundaries
+                ).astype(jnp.int32)
 
-            grid_mv, grid_m = cuda_p2g_v4_inline(
-                x_s, v_s, C_s, stress_s, cell_start,
-                params.num_grids, params.dt, params.vol, params.p_mass,
-                params.inv_dx, params.dx,
-            )
-
-            grid_mv = grid_update_fn(
-                grid_mv, grid_m, params.gravity, params.dt, params.damping)
-            grid_v = post_grid_fn(grid_mv, grid_m, 0.0)
-
-            if use_cuda_g2p:
-                new_x, new_v, new_C, new_F = cuda_g2p_fused(
-                    x_s, F_s, grid_v,
-                    params.num_grids, params.dt,
-                    params.inv_dx, params.dx, params.clip_bound,
+            with jax.named_scope("p2g_v4_inline"):
+                grid_mv, grid_m = cuda_p2g_v4_inline(
+                    x_s, v_s, C_s, stress_s, cell_start,
+                    params.num_grids, params.dt, params.vol, params.p_mass,
+                    params.inv_dx, params.dx,
                 )
-            else:
-                weight, dweight, dpos, index = compute_weights_and_indices(
-                    x_s, params.inv_dx, params.dx, params.num_grids)
-                new_x, new_v, new_C, new_F = g2p(
-                    grid_v, weight, dweight, dpos, index,
-                    F_s, x_s, params.dt, params.inv_dx, params.clip_bound)
 
-            new_F = plasticity_fn(new_F)
+            with jax.named_scope("grid_update"):
+                grid_mv = grid_update_fn(
+                    grid_mv, grid_m, params.gravity, params.dt, params.damping)
+                grid_v = post_grid_fn(grid_mv, grid_m, 0.0)
+
+            with jax.named_scope("g2p"):
+                if use_cuda_g2p:
+                    new_x, new_v, new_C, new_F = cuda_g2p_fused(
+                        x_s, F_s, grid_v,
+                        params.num_grids, params.dt,
+                        params.inv_dx, params.dx, params.clip_bound,
+                    )
+                else:
+                    weight, dweight, dpos, index = compute_weights_and_indices(
+                        x_s, params.inv_dx, params.dx, params.num_grids)
+                    new_x, new_v, new_C, new_F = g2p(
+                        grid_v, weight, dweight, dpos, index,
+                        F_s, x_s, params.dt, params.inv_dx, params.clip_bound)
+
+            with jax.named_scope("plasticity"):
+                new_F = plasticity_fn(new_F)
             return MPMState(x=new_x, v=new_v, C=new_C, F=new_F), None
 
         for _ in range(steps_per_frame):
@@ -791,57 +731,6 @@ def cuda_g2p_fused(x, F, grid_v, num_grids, dt, inv_dx, dx, clip_bound):
     )
 
     return new_x, new_v, new_C_flat.reshape(N, 3, 3), new_F_flat.reshape(N, 3, 3)
-
-
-def make_cuda_p2g(num_grids, kernel='scatter'):
-    """Create a CUDA-accelerated p2g function matching the solver interface.
-
-    Returns None if the prebuilt kernel is not available (.so missing or
-    failed to register).
-    """
-    if kernel == 'scatter':
-        if not is_available('scatter'):
-            return None
-
-        from mpm_jax.solver import p2g_compute
-
-        def cuda_p2g_v1(v, C, stress, weight, dweight, dpos, index, dt, vol, p_mass, num_grids):
-            mv, m = p2g_compute(v, C, stress, weight, dweight, dpos, dt, vol, p_mass)
-            return cuda_p2g_scatter(mv, m, index, num_grids)
-
-        return cuda_p2g_v1
-
-    elif kernel == 'warp':
-        if not is_available('warp'):
-            return None
-
-        from mpm_jax.solver import p2g_compute
-
-        def cuda_p2g_v3(v, C, stress, weight, dweight, dpos, index, dt, vol, p_mass, num_grids):
-            mv, m = p2g_compute(v, C, stress, weight, dweight, dpos, dt, vol, p_mass)
-            return cuda_p2g_scatter_warp(mv, m, index, num_grids)
-
-        return cuda_p2g_v3
-
-    elif kernel == 'smem':
-        if not is_available('smem'):
-            return None
-
-        from mpm_jax.solver import p2g_compute
-
-        def cuda_p2g_v4(v, C, stress, weight, dweight, dpos, index, dt, vol, p_mass, num_grids):
-            mv, m = p2g_compute(v, C, stress, weight, dweight, dpos, dt, vol, p_mass)
-            return cuda_p2g_scatter_smem(mv, m, index, num_grids)
-
-        return cuda_p2g_v4
-
-    elif kernel == 'fused':
-        if not is_available('fused'):
-            return None
-        logger.info("Fused CUDA P2G registered - use make_fused_stages()")
-        return None  # handled specially in the driver
-
-    return None
 
 
 def make_fused_stages(params, elasticity_cfg, plasticity_cfg, pre_particle_fn, post_grid_fn):

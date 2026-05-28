@@ -4,8 +4,8 @@
 //   * `p2g_inline.cu` (cuda_v1_inline): one thread per particle, inline
 //     B-spline weights + 27-stencil scatter computed in registers. No
 //     (N, 27, *) tensor is ever materialised in HBM.
-//   * `p2g_scatter_smem.cu` (cuda_v4): particles are sorted by their home
-//     SUPER-cell on the JAX side; one CUDA block per super-cell aggregates
+//   * Particles are sorted by their home SUPER-cell on the JAX side; one
+//     CUDA block per super-cell aggregates
 //     its particles' contributions into a 4x4x4 shared-memory tile via fast
 //     shmem atomics, then flushes the tile to global memory with one
 //     atomicAdd per node.
@@ -27,11 +27,9 @@
 //
 // The hypothesis is that the smem aggregation amortises the 27 global
 // atomicAdds per particle (108 floats) down to ~64 global atomicAdds per
-// super-cell. `cuda_v4` already did this for the scatter-only path with
-// 1 block per cell, but its inputs were the (N, 27, *) momentum/mass/index
-// tensors precomputed by JAX — which cost more than the smem aggregation
-// saved. With inline weight computation those tensors disappear from HBM
-// and only x/v/C/stress are loaded once per particle.
+// super-cell. With inline weight computation, the (N, 27, *) momentum/mass/
+// index tensors disappear from HBM and only x/v/C/stress are loaded once per
+// particle.
 //
 // Inputs (all float32 unless noted):
 //   x:          (N, 3)        particle positions (SORTED by home super-cell)

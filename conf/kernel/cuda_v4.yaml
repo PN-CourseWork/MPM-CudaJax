@@ -1,3 +1,0 @@
-# CUDA P2G scatter with shared memory staging (Gao et al. 2018).
-# Sorts particles by cell, one block per cell, 4x4x4 shared memory tile.
-name: cuda_v4
