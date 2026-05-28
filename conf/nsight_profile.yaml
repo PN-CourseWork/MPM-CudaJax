@@ -1,0 +1,65 @@
+# Hydra-driven Nsight Python profiler for kernel phases or full Warp timesteps.
+#
+# Example:
+#   pixi run -e gpu python profile_nsight.py -cn nsight_profile \
+#     kernel=warp_bonus_v2_graph nsight.phase=step sim.n_particles=1000000
+defaults:
+  - config
+  - _self_
+
+benchmark: true
+tag: nsight_profile
+
+nsight:
+  # p2g profiles only the dominant P2G phase. step profiles one full Warp
+  # timestep and emits one Nsight annotation per phase plus an enclosing step.
+  phase: step
+  include_step_total: true
+  write_json: true
+  plot:
+    enabled: false
+    metric: gpu__time_duration.sum
+    filename: nsight_plot.png
+    title: Nsight Kernel Metrics
+    row_panels: null
+    col_panels: null
+    x_keys: null
+    variant_fields: null
+    variant_annotations: null
+    plot_type: bar
+    show_aggregate: avg
+    annotate_points: false
+    print_data: false
+  # Native Nsight Python parameter sweep. Each entry is merged into the Hydra
+  # config before constructing the profiled Warp simulator. Common dimensions
+  # are unpacked into Nsight result columns: label, kernel_name, n_particles,
+  # num_grids, and steps_per_frame.
+  configs:
+    - label: default
+      kernel:
+        name: ${kernel.name}
+      sim:
+        n_particles: ${sim.n_particles}
+        num_grids: ${sim.num_grids}
+        steps_per_frame: ${sim.steps_per_frame}
+  # Passed directly to nsight.analyze.kernel after Hydra resolves the config.
+  # Any Nsight Python analyzer option with a YAML-serializable value can be
+  # overridden here, e.g. nsight.analyze.replay_mode=range.
+  analyze:
+    runs: 1
+    output: progress
+    output_csv: true
+    replay_mode: kernel
+    cache_control: all
+    clock_control: none
+    metrics:
+      - gpu__time_duration.sum
+      - sm__throughput.avg.pct_of_peak_sustained_elapsed
+      - gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed
+      - dram__throughput.avg.pct_of_peak_sustained_elapsed
+
+sim:
+  n_particles: 1000000
+  num_grids: 32
+  num_frames: 1
+  steps_per_frame: 1

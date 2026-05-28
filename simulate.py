@@ -64,6 +64,8 @@ def run_warp_bonus(cfg: DictConfig):
     sim = cfg.sim
     kernel_name = cfg.get('kernel', {}).get('name', 'warp_bonus_graph')
     indexed_sort = kernel_name == 'warp_bonus_v2_graph'
+    profile_name = cfg.get('profile', {}).get('name', 'none')
+    profile_warp = profile_name == 'warp'
 
     elasticity = cfg.get('material', {}).get('elasticity', {}).get('name', None)
     plasticity = cfg.get('material', {}).get('plasticity', {}).get('name', None)
@@ -94,7 +96,10 @@ def run_warp_bonus(cfg: DictConfig):
     frame_metrics = []
     total_steps = int(sim.num_frames) * int(sim.steps_per_frame)
 
-    if cfg.get('benchmark', False):
+    if profile_warp:
+        result = runner.run_frames_with_graph_timing(int(sim.num_frames))
+        elapsed = result.elapsed_s
+    elif cfg.get('benchmark', False):
         result = runner.run_frames(int(sim.num_frames))
         elapsed = result.elapsed_s
     else:
@@ -115,15 +120,29 @@ def run_warp_bonus(cfg: DictConfig):
             })
         elapsed = time.perf_counter() - t0
 
-    avg_frame_ms = elapsed / sim.num_frames * 1000
-    summary = {
-        'timestep': {
-            'mean_ms': avg_frame_ms,
-            'std_ms': 0.0,
-            'total_ms': elapsed * 1000,
-            'count': sim.num_frames,
+    if profile_warp:
+        summary = {
+            stage: {
+                'mean_ms': result.phase_ms_per_frame[stage],
+                'std_ms': 0.0,
+                'total_ms': result.phase_total_ms[stage],
+                'count': sim.num_frames,
+            }
+            for stage in result.phase_total_ms
         }
-    }
+        print("\nWarp graph event timing (inside captured graph):")
+        for stage, ms_per_step in sorted(result.phase_ms_per_step.items(), key=lambda x: -x[1]):
+            print(f"  {stage:15s}: {ms_per_step:8.3f} ms/step")
+    else:
+        avg_frame_ms = elapsed / sim.num_frames * 1000
+        summary = {
+            'timestep': {
+                'mean_ms': avg_frame_ms,
+                'std_ms': 0.0,
+                'total_ms': elapsed * 1000,
+                'count': sim.num_frames,
+            }
+        }
     return frames, elapsed, total_steps, summary, frame_metrics
 
 
@@ -417,10 +436,10 @@ def run_jax(cfg: DictConfig):
 def main(cfg: DictConfig):
     profile_name = cfg.get('profile', {}).get('name', 'none')
 
-    if profile_name not in ('none', 'jax'):
+    if profile_name not in ('none', 'jax', 'warp'):
         raise RuntimeError(
-            f"Unsupported profile={profile_name!r}. Only profile=none and "
-            "profile=jax are supported."
+            f"Unsupported profile={profile_name!r}. Only profile=none, "
+            "profile=jax, and profile=warp are supported."
         )
 
     kernel_name = cfg.get('kernel', {}).get('name', 'jax')
@@ -432,6 +451,8 @@ def main(cfg: DictConfig):
 
     if is_warp_bonus and profile_name == 'jax':
         raise RuntimeError(f"kernel={kernel_name} is pure Warp and does not emit a JAX trace.")
+    if profile_name == 'warp' and not is_warp_bonus:
+        raise RuntimeError(f"profile=warp is only supported for pure Warp kernels, got kernel={kernel_name}.")
 
     # JAX profiler (in-process, writes TensorBoard trace)
     jax_trace_dir = None

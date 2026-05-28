@@ -1,0 +1,3 @@
+# Pure Warp CUDA-graph event timing. Records CUDA events inside graph capture
+# and reports phase timings after graph launch/synchronization.
+name: warp

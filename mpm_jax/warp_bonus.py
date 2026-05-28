@@ -27,6 +27,13 @@ class WarpBonusResult:
     steps_per_sec: float
 
 
+@dataclass
+class WarpGraphTimingResult(WarpBonusResult):
+    phase_total_ms: dict[str, float]
+    phase_ms_per_frame: dict[str, float]
+    phase_ms_per_step: dict[str, float]
+
+
 @wp.func
 def _quad_weight(fx: float, offset: int):
     if offset == 0:
@@ -792,9 +799,11 @@ class WarpBonusSimulator:
         self.cursor = wp.zeros(self.Gs3, dtype=int, device=self.device)
         self.graphs = []
         self.graph_outputs = []
+        self.graph_timing_events = []
         self.graph_index = 0
         self.compiled = False
         self.indexed_sort = indexed_sort
+        self._capture_timing_events = None
         if indexed_sort:
             self.p2g_kernel = (
                 _p2g_supercell_stress_tile_indexed_kernel
@@ -813,7 +822,21 @@ class WarpBonusSimulator:
     def _set_state_tuple(self, state):
         self.x, self.v, self.C, self.F, self.x2, self.v2, self.C2, self.F2 = state
 
+    def _timing_begin(self, label: str):
+        if self._capture_timing_events is None:
+            return None
+        start = wp.Event(enable_timing=True)
+        end = wp.Event(enable_timing=True)
+        self._capture_timing_events.append((label, start, end))
+        wp.record_event(start)
+        return end
+
+    def _timing_end(self, end):
+        if end is not None:
+            wp.record_event(end)
+
     def _substep(self):
+        evt = self._timing_begin("bin")
         wp.launch(_zero_int_kernel, dim=self.Gs3, inputs=[self.counts], device=self.device)
         wp.launch(
             _count_supercells_kernel,
@@ -846,16 +869,23 @@ class WarpBonusSimulator:
                 ],
                 device=self.device,
             )
+        self._timing_end(evt)
+
+        evt = self._timing_begin("zero_grid")
         wp.launch(_zero_float_kernel, dim=self.G3, inputs=[self.grid_m], device=self.device)
         wp.launch(_zero_vec3_kernel, dim=self.G3, inputs=[self.grid_mv], device=self.device)
+        self._timing_end(evt)
+
         if self.indexed_sort:
             if self.precompute_stress:
+                evt = self._timing_begin("stress")
                 wp.launch(
                     _compute_stress_kernel,
                     dim=self.n,
                     inputs=[self.F, self.stress, self.mu, self.la],
                     device=self.device,
                 )
+                self._timing_end(evt)
                 p2g_inputs = [
                     self.ids, self.x, self.v, self.C, self.stress, self.cell_start,
                     self.G, self.dt, self.vol, self.p_mass, self.inv_dx, self.dx,
@@ -867,6 +897,7 @@ class WarpBonusSimulator:
                     self.G, self.dt, self.vol, self.p_mass, self.inv_dx, self.dx,
                     self.mu, self.la, self.grid_mv, self.grid_m,
                 ]
+            evt = self._timing_begin("p2g")
             wp.launch_tiled(
                 self.p2g_kernel,
                 dim=[self.Gs3],
@@ -874,7 +905,9 @@ class WarpBonusSimulator:
                 block_dim=self.tile_size,
                 device=self.device,
             )
+            self._timing_end(evt)
         else:
+            evt = self._timing_begin("p2g")
             wp.launch_tiled(
                 self.p2g_kernel,
                 dim=[self.Gs3],
@@ -886,6 +919,8 @@ class WarpBonusSimulator:
                 block_dim=self.tile_size,
                 device=self.device,
             )
+            self._timing_end(evt)
+        evt = self._timing_begin("grid_update")
         wp.launch(
             _grid_update_kernel,
             dim=self.G3,
@@ -895,7 +930,9 @@ class WarpBonusSimulator:
             ],
             device=self.device,
         )
+        self._timing_end(evt)
         if self.indexed_sort:
+            evt = self._timing_begin("g2p")
             wp.launch(
                 _g2p_indexed_kernel,
                 dim=self.n,
@@ -906,7 +943,9 @@ class WarpBonusSimulator:
                 ],
                 device=self.device,
             )
+            self._timing_end(evt)
         else:
+            evt = self._timing_begin("g2p")
             wp.launch(
                 _g2p_kernel,
                 dim=self.n,
@@ -917,18 +956,22 @@ class WarpBonusSimulator:
                 ],
                 device=self.device,
             )
+            self._timing_end(evt)
         self.x, self.x2 = self.x2, self.x
         self.v, self.v2 = self.v2, self.v
         self.C, self.C2 = self.C2, self.C
         self.F, self.F2 = self.F2, self.F
 
-    def _capture_one_frame(self):
+    def _capture_one_frame(self, timing: bool = False):
+        timing_events = [] if timing else None
+        self._capture_timing_events = timing_events
         with wp.ScopedCapture(device=self.device, force_module_load=True) as cap:
             for _ in range(self.steps_per_frame):
                 self._substep()
-        return cap.graph, self._state_tuple()
+        self._capture_timing_events = None
+        return cap.graph, self._state_tuple(), timing_events or []
 
-    def capture_frame(self):
+    def capture_frame(self, timing: bool = False):
         if not self.compiled:
             self._substep()
             wp.synchronize_device(self.device)
@@ -936,17 +979,20 @@ class WarpBonusSimulator:
 
         self.graphs = []
         self.graph_outputs = []
+        self.graph_timing_events = []
         self.graph_index = 0
 
         start = self._state_tuple()
-        graph, end = self._capture_one_frame()
+        graph, end, timing_events = self._capture_one_frame(timing=timing)
         self.graphs.append(graph)
         self.graph_outputs.append(end)
+        self.graph_timing_events.append(timing_events)
 
         if end[0] is not start[0]:
-            graph, end = self._capture_one_frame()
+            graph, end, timing_events = self._capture_one_frame(timing=timing)
             self.graphs.append(graph)
             self.graph_outputs.append(end)
+            self.graph_timing_events.append(timing_events)
 
     def warmup(self):
         self.capture_frame()
@@ -959,10 +1005,12 @@ class WarpBonusSimulator:
         self._launch_frame()
 
     def _launch_frame(self):
+        launched_index = self.graph_index
         wp.capture_launch(self.graphs[self.graph_index])
         self._set_state_tuple(self.graph_outputs[self.graph_index])
         if len(self.graphs) == 2:
             self.graph_index = 1 - self.graph_index
+        return launched_index
 
     def run_frames(self, num_frames: int):
         import time
@@ -979,4 +1027,40 @@ class WarpBonusSimulator:
             elapsed_s=elapsed,
             ms_per_step=elapsed * 1000.0 / total_steps,
             steps_per_sec=total_steps / elapsed,
+        )
+
+    def _read_graph_timing_ms(self, graph_index: int):
+        phase_total_ms = {}
+        for label, start, end in self.graph_timing_events[graph_index]:
+            phase_total_ms[label] = phase_total_ms.get(label, 0.0) + wp.get_event_elapsed_time(start, end)
+        return phase_total_ms
+
+    def run_frames_with_graph_timing(self, num_frames: int):
+        if not self.graphs or not self.graph_timing_events or not self.graph_timing_events[0]:
+            self.capture_frame(timing=True)
+        wp.synchronize_device(self.device)
+        phase_total_ms = {}
+        import time
+        t0 = time.perf_counter()
+        for _ in range(num_frames):
+            graph_index = self._launch_frame()
+            wp.synchronize_device(self.device)
+            frame_phase_ms = self._read_graph_timing_ms(graph_index)
+            for label, elapsed_ms in frame_phase_ms.items():
+                phase_total_ms[label] = phase_total_ms.get(label, 0.0) + elapsed_ms
+        elapsed = time.perf_counter() - t0
+        total_steps = num_frames * self.steps_per_frame
+        return WarpGraphTimingResult(
+            elapsed_s=elapsed,
+            ms_per_step=elapsed * 1000.0 / total_steps,
+            steps_per_sec=total_steps / elapsed,
+            phase_total_ms=phase_total_ms,
+            phase_ms_per_frame={
+                label: elapsed_ms / num_frames
+                for label, elapsed_ms in phase_total_ms.items()
+            },
+            phase_ms_per_step={
+                label: elapsed_ms / total_steps
+                for label, elapsed_ms in phase_total_ms.items()
+            },
         )

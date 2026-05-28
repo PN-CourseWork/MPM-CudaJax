@@ -1,0 +1,58 @@
+# Example native Nsight Python parameter sweep.
+#
+# Run:
+#   pixi run -e gpu python profile_nsight.py -cn nsight_profile_sweep
+defaults:
+  - nsight_profile
+  - _self_
+
+kernel:
+  name: warp_bonus_v2_graph
+
+nsight:
+  phase: step
+  analyze:
+    runs: 3
+    metrics:
+      - gpu__time_duration.sum
+  plot:
+    enabled: true
+    metric: gpu__time_duration.sum
+    x_keys:
+      - n_particles
+    variant_fields:
+      - kernel_name
+    variant_annotations:
+      - p2g
+      - g2p
+    filename: nsight_sweep.png
+    title: Warp Bonus Sweep
+  configs:
+    - label: v1_1m
+      kernel:
+        name: warp_bonus_graph
+      sim:
+        n_particles: 1000000
+        num_grids: 32
+        steps_per_frame: 1
+    - label: v2_1m
+      kernel:
+        name: warp_bonus_v2_graph
+      sim:
+        n_particles: 1000000
+        num_grids: 32
+        steps_per_frame: 1
+    - label: v1_10m
+      kernel:
+        name: warp_bonus_graph
+      sim:
+        n_particles: 10000000
+        num_grids: 32
+        steps_per_frame: 1
+    - label: v2_10m
+      kernel:
+        name: warp_bonus_v2_graph
+      sim:
+        n_particles: 10000000
+        num_grids: 32
+        steps_per_frame: 1

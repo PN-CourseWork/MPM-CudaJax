@@ -83,6 +83,9 @@ cuda-nvcc = "*"
 gxx = "*"
 warp-lang = "*"
 
+[tool.pixi.feature.gpu.pypi-dependencies]
+nsight-python = "*"
+
 [tool.pixi.feature.gpu.system-requirements]
 cuda = "12.0"
 
