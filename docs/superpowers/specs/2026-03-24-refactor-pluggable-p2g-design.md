@@ -6,7 +6,7 @@
 
 ## Goal
 
-Simplify the MPM-CudaJax codebase while preserving all functionality. Replace the monolithic JIT'd timestep loop with a Python-level loop calling individually-JIT'd stages. Make P2G pluggable so JAX baseline and CUDA kernel variants share the same interface. Replace JAX FFI with `cuda.core` for native CUDA kernel compilation and launch. Ensure all metrics are observable via wandb.
+Simplify the MPM-CudaJax codebase while preserving all functionality. Replace the monolithic JIT'd timestep loop with a Python-level loop calling individually-JIT'd stages. Make P2G pluggable so JAX baseline and CUDA kernel variants share the same interface. Replace JAX FFI with `cuda.core` for native CUDA kernel compilation and launch. Emit local timing metrics for sweeps and post-processing.
 
 ## Key Decisions
 
@@ -14,7 +14,7 @@ Simplify the MPM-CudaJax codebase while preserving all functionality. Replace th
 2. **Pluggable P2G** — all variants implement `(state, params) -> (grid_mv, grid_m)`. Selected at runtime via Hydra config.
 3. **`cuda.core`** — replaces JAX FFI for kernel compilation and launch. Runtime JIT from `.cu` source, cached after first compile. GPU pointer interop via `jax.dlpack` / `__cuda_array_interface__` (see JAX–CUDA Interop section).
 4. **Shared CUDA compute** — `p2g_compute.cuh` device header contains B-spline weights, SVD stress, APIC momentum. Scatter variants only differ in how they write to the grid.
-5. **Wandb logging** — dict-based `wandb.log()` for time series, `wandb.summary.update()` for headline metrics. Hydra config auto-captured.
+5. **Local metrics** — write fixed-shape run summaries and stage timings for sweep aggregation.
 6. **Removed:** shared-memory kernel (v4). **Kept:** JAX baseline, CUDA naive scatter, CUDA warp-reduced scatter.
 7. **Naming:** existing `cuda_v1`/`cuda_v3` are renamed to `cuda_naive`/`cuda_warp` for clarity. The old `cuda_v2` (fused WIP) is superseded — the new CUDA variants are all fused (compute+scatter in one kernel launch) by design.
 
@@ -22,7 +22,7 @@ Simplify the MPM-CudaJax codebase while preserving all functionality. Replace th
 
 ```
 MPM-CudaJax/
-├── simulate.py              # Hydra entry, timestep loop, wandb logging
+├── simulate.py              # Hydra entry, timestep loop, local metrics
 ├── mpm_jax/
 │   ├── state.py             # MPMState, MPMParams (NamedTuples)
 │   ├── grid_update.py       # @jax.jit grid_update(grid_mv, grid_m, params) -> grid_v
@@ -277,17 +277,10 @@ for frame in range(num_frames):
         })
 ```
 
-## Wandb Logging
+## Local Metrics
 
 ```python
-wandb.init(project="mpm-cuda", config=OmegaConf.to_container(cfg))
-
-# Per-frame time series (aggregate substeps per frame to avoid excessive logging)
-for frame_timings in frame_timing_list:
-    wandb.log(frame_timings)
-
-# Summary
-wandb.summary.update({
+results = {
     "mean_p2g_ms": np.mean([t["p2g_ms"] for t in step_timings]),
     "mean_grid_update_ms": np.mean([t["grid_update_ms"] for t in step_timings]),
     "mean_g2p_ms": np.mean([t["g2p_ms"] for t in step_timings]),
@@ -296,7 +289,7 @@ wandb.summary.update({
     "steps_per_sec": total_steps / total_time,
     "n_particles": cfg.sim.n_particles,
     "kernel": cfg.kernel.name,
-})
+}
 ```
 
 ## Hydra Config
@@ -328,7 +321,7 @@ Material, sim configs unchanged. Profile configs removed (timing is now built-in
 
 - All constitutive models and boundary conditions
 - Hydra configuration system
-- Wandb integration (simplified)
+- Local metrics output
 - Test suite (updated for new module structure)
 - GIF rendering for non-benchmark runs
 

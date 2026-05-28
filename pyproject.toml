@@ -13,7 +13,6 @@ dependencies = [
     "matplotlib",
     "tqdm",
     "numpy",
-    "wandb",
     "warp-lang",
     "pyvista",
 ]
@@ -43,7 +42,6 @@ omegaconf = "*"
 matplotlib = "*"
 tqdm = "*"
 numpy = "*"
-wandb = "*"
 cmake = ">=3.24"
 scikit-build-core = ">=0.10"
 ninja = "*"
@@ -133,12 +131,12 @@ hpc = { features = ["hpc", "dev"], solve-group = "hpc" }
 [tool.pixi.tasks]
 test = "pytest tests/ -v"
 lint = "ruff check ."
-clean = { cmd = "rm -f mpm_jax/cuda/_lib/*.so mpm_jax/cuda/kernels/*.so && rm -rf build multirun outputs output wandb && rm -f *.nsys-rep *.sqlite && find . -type d -name __pycache__ -exec rm -rf {} +" }
+clean = { cmd = "rm -f mpm_jax/cuda/_lib/*.so mpm_jax/cuda/kernels/*.so && rm -rf build multirun outputs output && rm -f *.nsys-rep *.sqlite && find . -type d -name __pycache__ -exec rm -rf {} +" }
 
 # Push the working tree to a remote host (e.g. `pixi run sync lambda`).
 # Excludes generated dirs (.pixi, build, outputs, etc.) and arch-specific
 # CUDA .so files — the remote rebuilds those on its own `pixi install -e gpu`.
-sync = { args = [{ arg = "host" }], cmd = "rsync -ahz --info=stats1,name0 --exclude=.pixi --exclude=.venv --exclude=build --exclude=outputs --exclude=multirun --exclude=output --exclude=wandb --exclude=mpm_jax/cuda/_lib --exclude=__pycache__ --exclude='*.nsys-rep' --exclude='*.sqlite' --exclude='*.egg-info' --exclude=.pytest_cache ./ {{ host }}:~/MPM-CudaJax/" }
+sync = { args = [{ arg = "host" }], cmd = "rsync -ahz --info=stats1,name0 --exclude=.pixi --exclude=.venv --exclude=build --exclude=outputs --exclude=multirun --exclude=output --exclude=mpm_jax/cuda/_lib --exclude=__pycache__ --exclude='*.nsys-rep' --exclude='*.sqlite' --exclude='*.egg-info' --exclude=.pytest_cache ./ {{ host }}:~/MPM-CudaJax/" }
 
 # Pull Hydra run outputs back from a remote host (e.g. `pixi run sync-results lambda`).
 # One rsync with include/exclude rules so missing source dirs are silently skipped.

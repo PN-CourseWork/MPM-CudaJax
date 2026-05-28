@@ -5,9 +5,6 @@ the sort is a 5%, 50%, or 200% overhead on top of the kernel work it's
 supposed to coalesce.
 """
 
-import os
-os.environ['WANDB_MODE'] = 'disabled'
-
 import time
 import numpy as np
 import jax

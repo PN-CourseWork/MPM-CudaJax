@@ -8,9 +8,6 @@ Run on a GPU box:
     pixi run -e gpu python scripts/check_v4_equivalence.py
 """
 
-import os
-os.environ['WANDB_MODE'] = 'disabled'
-
 import numpy as np
 import jax
 import jax.numpy as jnp

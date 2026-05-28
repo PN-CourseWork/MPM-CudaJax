@@ -11,8 +11,6 @@ mpm_jax/cuda/_lib/*
 output/
 outputs/
 .pytest_cache/
-wandb/
 
 multirun/
 outputs/
-wandb/

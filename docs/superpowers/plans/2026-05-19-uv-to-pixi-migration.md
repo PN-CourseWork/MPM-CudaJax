@@ -59,7 +59,6 @@ omegaconf = "*"
 matplotlib = "*"
 tqdm = "*"
 numpy = "*"
-wandb = "*"
 cmake = ">=3.24"
 scikit-build-core = ">=0.10"
 ninja = "*"
@@ -164,7 +163,7 @@ Append to `pyproject.toml`:
 [tool.pixi.tasks]
 test = "pytest tests/ -v"
 lint = "ruff check ."
-clean = { cmd = "rm -f mpm_jax/cuda/_lib/*.so mpm_jax/cuda/kernels/*.so && rm -rf build multirun outputs output wandb && rm -f *.nsys-rep *.sqlite && find . -type d -name __pycache__ -exec rm -rf {} +" }
+clean = { cmd = "rm -f mpm_jax/cuda/_lib/*.so mpm_jax/cuda/kernels/*.so && rm -rf build multirun outputs output && rm -f *.nsys-rep *.sqlite && find . -type d -name __pycache__ -exec rm -rf {} +" }
 
 [tool.pixi.feature.gpu.tasks]
 sim = "python simulate.py"
@@ -224,11 +223,9 @@ mpm_jax/cuda/_lib/
 output/
 outputs/
 .pytest_cache/
-wandb/
 
 multirun/
 outputs/
-wandb/
 ```
 
 - [ ] **Step 3: Verify `git status` is clean of those files**
@@ -253,7 +250,7 @@ git commit -m "build: drop Makefile and uv artifacts in favor of pixi"
 - [ ] **Step 1: Clear any stale outputs**
 
 Run: `pixi run clean`
-Expected: removes `output/`, `outputs/`, `multirun/`, `wandb/`, and any built `.so` files.
+Expected: removes `output/`, `outputs/`, `multirun/`, and any built `.so` files.
 
 - [ ] **Step 2: Run a short JAX simulation**
 
@@ -341,7 +338,6 @@ Outputs:
 - Hydra logs / config snapshots → `outputs/<date>/<run>/`
 - Multirun sweep results → `multirun/<date>/<run>/`
 - Built CUDA `.so` files → `mpm_jax/cuda/_lib/` (rebuilds on `.cu` edit via `editable.rebuild=true`)
-- wandb logs (online by default; set `WANDB_MODE=disabled` for offline)
 
 If you want a guided tour of the kernel variants and what each one does,
 see [Kernel variants](#kernel-variants) below.
@@ -533,13 +529,13 @@ to:
 And change the bullet:
 
 ```
-- Don't commit `build/`, `output/`, `outputs/`, `multirun/`, `wandb/`, `*.nsys-rep`, `*.sqlite`, or `uv.lock` (`.gitignore` covers these).
+- Don't commit `build/`, `output/`, `outputs/`, `multirun/`, `*.nsys-rep`, `*.sqlite`, or `uv.lock` (`.gitignore` covers these).
 ```
 
 to:
 
 ```
-- Don't commit `build/`, `output/`, `outputs/`, `multirun/`, `wandb/`, `*.nsys-rep`, `*.sqlite`, or `.pixi/` (`.gitignore` covers these). DO commit `pixi.lock`.
+- Don't commit `build/`, `output/`, `outputs/`, `multirun/`, `*.nsys-rep`, `*.sqlite`, or `.pixi/` (`.gitignore` covers these). DO commit `pixi.lock`.
 ```
 
 - [ ] **Step 4: Verify no `uv` references remain**

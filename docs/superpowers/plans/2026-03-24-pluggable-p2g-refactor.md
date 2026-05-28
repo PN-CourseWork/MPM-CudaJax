@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Refactor MPM-CudaJax into a clean Python timestep loop with pluggable P2G implementations (JAX baseline + CUDA variants via `cuda.core`), per-stage timing, and wandb logging.
+**Goal:** Refactor MPM-CudaJax into a clean Python timestep loop with pluggable P2G implementations (JAX baseline + CUDA variants via `cuda.core`) and per-stage timing.
 
-**Architecture:** Break the monolithic `solver.py` into focused modules (`state.py`, `grid_update.py`, `g2p.py`, `p2g/`). Each P2G variant implements `(state, params) -> (grid_mv, grid_m)`. CUDA kernels compile at runtime via `cuda.core`. The timestep loop lives in `simulate.py` with `time.perf_counter()` between stages, all logged to wandb.
+**Architecture:** Break the monolithic `solver.py` into focused modules (`state.py`, `grid_update.py`, `g2p.py`, `p2g/`). Each P2G variant implements `(state, params) -> (grid_mv, grid_m)`. CUDA kernels compile at runtime via `cuda.core`. The timestep loop lives in `simulate.py` with `time.perf_counter()` between stages and local metrics output.
 
-**Tech Stack:** JAX, cuda-core (NVIDIA cuda-python), Hydra, wandb, pytest
+**Tech Stack:** JAX, cuda-core (NVIDIA cuda-python), Hydra, pytest
 
 **Spec:** `docs/superpowers/specs/2026-03-24-refactor-pluggable-p2g-design.md`
 
@@ -35,7 +35,7 @@
 ### Modified Files
 | File | Changes |
 |------|---------|
-| `simulate.py` | Rewrite: Python timestep loop, wandb logging, remove profiler wrappers |
+| `simulate.py` | Rewrite: Python timestep loop, local metrics, remove profiler wrappers |
 | `conf/config.yaml` | Update kernel defaults |
 | `conf/kernel/*.yaml` | Rename: `cuda_v1` → `cuda_naive`, `cuda_v3` → `cuda_warp`, drop `cuda_v4` |
 | `pyproject.toml` | Add `cuda-core` optional dependency |
@@ -1416,7 +1416,7 @@ git commit -m "feat: add CUDA P2G wrappers (naive + warp) with cuda.core"
 
 ---
 
-### Task 10: Rewrite simulate.py — Python loop + wandb
+### Task 10: Rewrite simulate.py — Python loop + local metrics
 
 **Files:**
 - Modify: `simulate.py`
@@ -1477,7 +1477,6 @@ import hydra
 import numpy as np
 import jax
 import jax.numpy as jnp
-import wandb
 from omegaconf import DictConfig, OmegaConf
 
 from mpm_jax.state import MPMState, make_params
@@ -1583,26 +1582,12 @@ def simulate(cfg: DictConfig):
     return step_timings, frames, total_time
 
 
-def log_to_wandb(cfg, step_timings, total_time):
-    """Log metrics to wandb."""
-    wandb.init(project="mpm-cuda", config=OmegaConf.to_container(cfg))
-
+def write_results(cfg, step_timings, total_time):
+    """Write local metrics."""
     sim = cfg.sim
     steps_per_frame = sim.steps_per_frame
-
-    # Per-frame aggregated time series
-    for f in range(sim.num_frames):
-        frame_steps = step_timings[f * steps_per_frame : (f + 1) * steps_per_frame]
-        wandb.log({
-            "frame_p2g_ms": sum(t["p2g_ms"] for t in frame_steps),
-            "frame_grid_update_ms": sum(t["grid_update_ms"] for t in frame_steps),
-            "frame_g2p_ms": sum(t["g2p_ms"] for t in frame_steps),
-            "frame_step_ms": sum(t["step_ms"] for t in frame_steps),
-        })
-
-    # Summary
     total_steps = len(step_timings)
-    wandb.summary.update({
+    results = {
         "mean_p2g_ms": np.mean([t["p2g_ms"] for t in step_timings]),
         "mean_grid_update_ms": np.mean([t["grid_update_ms"] for t in step_timings]),
         "mean_g2p_ms": np.mean([t["g2p_ms"] for t in step_timings]),
@@ -1612,15 +1597,14 @@ def log_to_wandb(cfg, step_timings, total_time):
         "steps_per_sec": total_steps / total_time,
         "n_particles": cfg.sim.n_particles,
         "kernel": cfg.kernel.name,
-    })
-
-    wandb.finish()
+    }
+    return results
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig):
     step_timings, frames, total_time = simulate(cfg)
-    log_to_wandb(cfg, step_timings, total_time)
+    write_results(cfg, step_timings, total_time)
 
     if not cfg.benchmark and frames:
         # Reuse the existing visualize_frames() from simulate.py
@@ -1640,7 +1624,7 @@ Note: The boundary condition integration needs to match the existing `build_boun
 git add simulate.py conf/config.yaml conf/kernel/cuda_naive.yaml conf/kernel/cuda_warp.yaml conf/kernel/jax.yaml
 git rm conf/kernel/cuda_v1.yaml conf/kernel/cuda_v2.yaml conf/kernel/cuda_v3.yaml conf/kernel/cuda_v4.yaml
 git rm -rf conf/profile/ conf/sweep_*.yaml
-git commit -m "refactor: rewrite simulate.py with Python timestep loop and wandb logging"
+git commit -m "refactor: rewrite simulate.py with Python timestep loop and local metrics"
 ```
 
 ---
@@ -1687,14 +1671,11 @@ cd MPM-CudaJax
 uv run --extra jax python simulate.py kernel=jax sim.num_frames=5 benchmark=true
 ```
 
-Expected: Completes without error, logs to wandb with per-frame and summary metrics.
+Expected: Completes without error and writes local timing metrics.
 
-- [ ] **Step 2: Verify wandb dashboard**
+- [ ] **Step 2: Verify local results**
 
-Check that the wandb run contains:
-- Per-frame time series (`frame_p2g_ms`, `frame_grid_update_ms`, `frame_g2p_ms`)
-- Summary metrics (`mean_p2g_ms`, `steps_per_sec`, etc.)
-- Config captured from Hydra
+Check that the run output contains summary metrics (`mean_p2g_ms`, `steps_per_sec`, etc.).
 
 - [ ] **Step 3: Run all tests one final time**
 

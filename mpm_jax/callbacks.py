@@ -9,7 +9,7 @@ dumped, and produces two seaborn plots into the multirun root:
 
 Plus ``results.csv`` (long-form pandas dataframe) for downstream tooling.
 
-The callback uses only matplotlib + seaborn + pandas; no wandb dependency.
+The callback uses only matplotlib + seaborn + pandas.
 Failures are caught and printed — the sweep itself is never blocked by a
 plotting hiccup.
 

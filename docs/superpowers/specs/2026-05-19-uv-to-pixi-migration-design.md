@@ -38,7 +38,6 @@ omegaconf = "*"
 matplotlib = "*"
 tqdm = "*"
 numpy = "*"
-wandb = "*"
 # Build tools so the editable install can compile the wheel even on CPU envs
 # (the CUDA portion is gated by `check_language(CUDA)` and is skipped if nvcc
 # isn't on PATH).
@@ -87,7 +86,7 @@ test = "pytest tests/ -v"
 lint = "ruff check ."
 clean = """
 rm -f mpm_jax/cuda/_lib/*.so mpm_jax/cuda/kernels/*.so && \
-rm -rf build/ multirun/ outputs/ output/ wandb/ && \
+rm -rf build/ multirun/ outputs/ output/ && \
 rm -f *.nsys-rep *.sqlite && \
 find . -type d -name __pycache__ -exec rm -rf {} +
 """

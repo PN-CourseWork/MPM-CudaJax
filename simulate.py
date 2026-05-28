@@ -6,8 +6,7 @@ import ctypes
 import numpy as np
 from tqdm import tqdm
 import hydra
-from omegaconf import DictConfig, OmegaConf
-import wandb
+from omegaconf import DictConfig
 
 
 # ---------------------------------------------------------------------------
@@ -524,51 +523,6 @@ def run_jax(cfg: DictConfig):
 
 
 # ---------------------------------------------------------------------------
-# Wandb logging (all after timing is complete)
-# ---------------------------------------------------------------------------
-
-def log_results(backend, elapsed, total_steps, summary, frame_metrics, frames, cfg, export_path):
-    """Log all metrics to wandb. Called only after timing is done."""
-    steps_per_sec = total_steps / elapsed
-    ms_per_step = elapsed / total_steps * 1000
-    steps_per_frame = cfg.sim.steps_per_frame
-
-    # Per-frame time series (stage timings + physics metrics)
-    for i, fm in enumerate(frame_metrics):
-        step_idx = (i + 1) * steps_per_frame
-        wandb.log({k: v for k, v in fm.items()}, step=step_idx)
-
-    # Summary scalars
-    n_particles = cfg.sim.n_particles
-    wandb.log({
-        'summary/total_steps': total_steps,
-        'summary/elapsed_s': elapsed,
-        'summary/steps_per_sec': steps_per_sec,
-        'summary/ms_per_step': ms_per_step,
-        'summary/n_particles': n_particles,
-    })
-
-    # Per-stage breakdown table
-    stage_table = wandb.Table(
-        columns=["stage", "mean_ms", "std_ms", "total_ms", "count", "pct"],
-    )
-    total_ms = sum(s['total_ms'] for s in summary.values())
-    for stage, stats in sorted(summary.items(), key=lambda x: -x[1]['total_ms']):
-        pct = stats['total_ms'] / total_ms * 100 if total_ms > 0 else 0
-        stage_table.add_data(stage, round(stats['mean_ms'], 4), round(stats['std_ms'], 4),
-                             round(stats['total_ms'], 2), stats['count'], round(pct, 1))
-        wandb.log({
-            f'stage/{stage}_mean_ms': stats['mean_ms'],
-            f'stage/{stage}_pct': pct,
-        })
-    wandb.log({'stage_breakdown': stage_table})
-
-    # Animation
-    if export_path and os.path.exists(export_path):
-        wandb.log({'animation': wandb.Video(export_path, format='gif')})
-
-
-# ---------------------------------------------------------------------------
 # Profiler integration (nsys, ncu, jax)
 # ---------------------------------------------------------------------------
 
@@ -584,7 +538,7 @@ def _relaunch_under_profiler(profile_name, cfg):
 
     The .nsys-rep / .csv is written into the Hydra run output dir, and the
     inner Python process is told to reuse the same dir so its simulate.log
-    / wandb files end up next to the profile report.
+    ends up next to the profile report.
     """
     import sys
     from hydra.core.hydra_config import HydraConfig
@@ -634,7 +588,7 @@ def _relaunch_under_profiler(profile_name, cfg):
 
 
 def _extract_nsys_stats(cfg):
-    """Extract kernel timings from the nsys .nsys-rep file and log to wandb."""
+    """Extract and print kernel timings from the nsys .nsys-rep file."""
     import glob
     import io
     from hydra.core.hydra_config import HydraConfig
@@ -678,18 +632,11 @@ def _extract_nsys_stats(cfg):
         df = pd.read_csv(io.StringIO(csv_text))
         print("\nCUDA Kernel Summary:")
         print(df.to_string(index=False))
-        wandb.log({"nsys_kernel_summary": wandb.Table(dataframe=df)})
+        csv_out = os.path.splitext(report_path)[0] + "_kernel_summary.csv"
+        df.to_csv(csv_out, index=False)
+        print(f"Wrote kernel summary to {csv_out}")
     except ImportError:
-        wandb.log({"nsys_kernel_csv": wandb.Html(f"<pre>{csv_text}</pre>")})
-
-    # Upload raw report as artifact
-    artifact = wandb.Artifact(
-        f"nsys-{cfg.get('kernel', {}).get('name', 'jax')}-N{cfg.sim.n_particles}",
-        type="profile",
-    )
-    artifact.add_file(report_path)
-    wandb.log_artifact(artifact)
-    print(f"Uploaded {report_path} as wandb artifact.")
+        print(csv_text)
 
 
 def _parse_ncu_csv(csv_path):
@@ -796,7 +743,7 @@ def _print_ncu_summary(summary):
 
 
 def _extract_ncu_stats(cfg):
-    """Extract Nsight Compute CSV results, summarise, and log to wandb."""
+    """Extract Nsight Compute CSV results and print a summary."""
     import glob
     from hydra.core.hydra_config import HydraConfig
 
@@ -828,26 +775,6 @@ def _extract_ncu_stats(cfg):
             print("\n".join("  " + line.rstrip() for line in head.splitlines() if line.strip()))
     else:
         _print_ncu_summary(summary)
-        # Log to wandb as a flat table.
-        try:
-            table = wandb.Table(columns=["kernel", "launches", "avg_us", "total_ms", "pct_time"])
-            total_us = sum(v['duration_us_total'] for v in summary.values()) or 1.0
-            for kname, d in sorted(summary.items(), key=lambda kv: -kv[1]['duration_us_total']):
-                table.add_data(kname, d['launches'],
-                               round(d['duration_us_avg'], 2),
-                               round(d['duration_us_total'] / 1000.0, 3),
-                               round(100.0 * d['duration_us_total'] / total_us, 1))
-            wandb.log({"ncu_kernel_summary": table})
-        except Exception as e:
-            print(f"(wandb table upload failed: {e})")
-
-    artifact = wandb.Artifact(
-        f"ncu-{cfg.get('kernel', {}).get('name', 'jax')}-N{cfg.sim.n_particles}",
-        type="profile",
-    )
-    artifact.add_file(csv_path)
-    wandb.log_artifact(artifact)
-    print(f"Uploaded {csv_path} as wandb artifact.")
 
 
 # ---------------------------------------------------------------------------
@@ -865,21 +792,10 @@ def main(cfg: DictConfig):
         return  # unreachable — _relaunch calls sys.exit
 
     kernel_name = cfg.get('kernel', {}).get('name', 'jax')
-    N = cfg.sim.n_particles
-    G = cfg.sim.num_grids
 
     # CUDA Graphs toggle (v6) must happen before any `import jax` in this
     # process — including the profile=jax branch a few lines down.
     _maybe_enable_cuda_graphs(kernel_name)
-
-    # Init wandb
-    wandb_cfg = OmegaConf.to_container(cfg, resolve=True)
-    wandb.init(
-        project="MPM-CudaJAX",
-        name=f"jax_{kernel_name}_N{N}_G{G}",
-        config=wandb_cfg,
-        tags=[kernel_name, f"N{N}", f"G{G}", profile_name],
-    )
 
     # JAX profiler (in-process, writes TensorBoard trace)
     jax_trace_dir = None
@@ -892,8 +808,8 @@ def main(cfg: DictConfig):
         jax.profiler.start_trace(jax_trace_dir)
         print(f"JAX profiler started -> {jax_trace_dir}")
 
-    # Run simulation (timing-critical — no wandb calls inside)
-    frames, elapsed, total_steps, summary, frame_metrics = run_jax(cfg)
+    # Run simulation.
+    frames, elapsed, total_steps, summary, _frame_metrics = run_jax(cfg)
 
     # Stop JAX profiler
     if profile_name == 'jax':
@@ -925,8 +841,8 @@ def main(cfg: DictConfig):
         print("\nBenchmark mode: skipping GIF rendering.")
 
     # Dump a small results.json into the Hydra run dir so multirun callbacks
-    # (and any post-hoc aggregation) can pick up the per-run numbers without
-    # touching wandb. One file per run, fixed shape.
+    # and post-hoc aggregation can pick up the per-run numbers. One file per
+    # run, fixed shape.
     import json
     from hydra.core.hydra_config import HydraConfig
     run_dir = os.path.abspath(HydraConfig.get().runtime.output_dir)
@@ -948,21 +864,11 @@ def main(cfg: DictConfig):
     with open(os.path.join(run_dir, 'results.json'), 'w') as f:
         json.dump(results, f, indent=2)
 
-    # Log timing results to wandb
-    log_results(kernel_name, elapsed, total_steps, summary, frame_metrics, frames, cfg, export_path)
-
-    # Extract and log profiler results
+    # Extract profiler results.
     if profile_name == 'nsys':
         _extract_nsys_stats(cfg)
     elif profile_name == 'ncu':
         _extract_ncu_stats(cfg)
-    elif profile_name == 'jax' and jax_trace_dir:
-        artifact = wandb.Artifact(f"jax-trace-{kernel_name}-N{N}", type="profile")
-        artifact.add_dir(jax_trace_dir)
-        wandb.log_artifact(artifact)
-        print("Uploaded JAX trace as wandb artifact.")
-
-    wandb.finish()
 
 
 if __name__ == "__main__":

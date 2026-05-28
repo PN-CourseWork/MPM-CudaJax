@@ -52,7 +52,6 @@ Outputs:
 - Hydra logs / config snapshots → `outputs/<date>/<run>/`
 - Multirun sweep results → `multirun/<date>/<run>/`
 - Built CUDA `.so` files → `mpm_jax/cuda/_lib/` (rebuilds on `.cu` edit via `editable.rebuild=true`)
-- wandb logs (online by default; set `WANDB_MODE=disabled` for offline)
 
 If you want a guided tour of the kernel variants and what each one does,
 see [Kernel variants](#kernel-variants) below.
@@ -193,8 +192,7 @@ pixi run -e gpu python simulate.py -cn sweep_profile
 ```
 
 Each combination gets its own `multirun/<date>/<run>/` subdir. Sweeps
-must use Hydra multirun (not a bash `for` loop) so wandb runs and log
-parsers see the structure they expect.
+should use Hydra multirun so log parsers see the structure they expect.
 
 ## Profiling
 
@@ -214,8 +212,8 @@ pixi run -e gpu python simulate.py profile=jax  benchmark=true \
 For `nsys` / `ncu`, `simulate.py` **re-launches itself under the profiler**
 (gated by an `_MPM_INSIDE_PROFILER` env var so the inner process knows
 not to do the same thing again). The inner process is passed
-`hydra.run.dir=<outer_outdir>` so its simulate.log, wandb run, and the
-profile report all land in the same Hydra run dir:
+`hydra.run.dir=<outer_outdir>` so its simulate.log and profile report land
+in the same Hydra run dir:
 
 ```
 outputs/<YYYY-MM-DD>/<HH-MM-SS>/
@@ -225,9 +223,7 @@ outputs/<YYYY-MM-DD>/<HH-MM-SS>/
   └── profile_cuda_fused_N10000.csv         # (with profile=ncu)
 ```
 
-The report is also uploaded to wandb as an artifact (with `profile=jax`,
-the TensorBoard trace dir is the artifact). Use the multirun output dir
-naming for sweeps: each Hydra run gets its own subdir under
+Use the multirun output dir naming for sweeps: each Hydra run gets its own subdir under
 `multirun/<date>/<run>/`, with the same colocated structure.
 
 Notes:
@@ -276,7 +272,7 @@ pixi run test
 
 ```
 MPM-CudaJax/
-├── simulate.py              # Hydra entry + wandb + profiler re-launch
+├── simulate.py              # Hydra entry + profiler re-launch
 ├── pyproject.toml           # scikit-build-core build + pixi cpu / gpu envs
 ├── pixi.lock                # locked deps for both envs (commit this)
 ├── CMakeLists.txt           # CUDA kernel build (called by scikit-build-core)

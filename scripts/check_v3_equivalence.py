@@ -11,9 +11,6 @@ original order). Tolerances are loose because f32 + atomic-reduction order
 differences accumulate, especially at N=2000 over 30 substeps.
 """
 
-import os
-os.environ['WANDB_MODE'] = 'disabled'
-
 import numpy as np
 import jax
 import jax.numpy as jnp
