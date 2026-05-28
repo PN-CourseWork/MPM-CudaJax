@@ -1,11 +1,10 @@
+import pyvista as pv
 import os
 import time
 import subprocess
 import ctypes
 import numpy as np
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import wandb
@@ -51,26 +50,39 @@ def get_particles(n_particles, center, size):
 
 def visualize_frames(frames, export_path, center=[0.5, 0.5, 0.5],
                      size=[2.0, 2.0, 2.0], c='blue', s=20, fps=30):
-    xlim = [center[0] - size[0]/2, center[0] + size[0]/2]
-    ylim = [center[1] - size[1]/2, center[1] + size[1]/2]
-    zlim = [center[2] - size[2]/2, center[2] + size[2]/2]
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
-    ax.set_xlim(xlim)
-    ax.set_ylim(ylim)
-    ax.set_zlim(zlim)
+    try:
+        # Need to start xvfb for pyvista offscreen rendering to work without a display
+        # But we can also set the VTK render window to offscreen before plotting
+        pv.start_xvfb()
+    except Exception:
+        pass
 
-    def update(frame):
-        ax.cla()
-        ax.set_xlim(xlim)
-        ax.set_ylim(ylim)
-        ax.set_zlim(zlim)
-        ax.scatter(frames[frame][:, 0], frames[frame][:, 1], frames[frame][:, 2], s=s, c=c)
-        ax.set_title(f'Frame {frame}')
+    plotter = pv.Plotter(off_screen=True)
+    plotter.open_gif(export_path)
 
-    ani = FuncAnimation(fig, update, frames=len(frames), blit=False)
-    ani.save(export_path, writer='pillow', fps=fps)
-    plt.close()
+    # Initialize point cloud
+    points = frames[0]
+    cloud = pv.PolyData(points)
+    plotter.add_mesh(cloud, color=c, point_size=s, render_points_as_spheres=True)
+
+    # Add bounding box
+    bounds = [
+        center[0] - size[0]/2, center[0] + size[0]/2,
+        center[1] - size[1]/2, center[1] + size[1]/2,
+        center[2] - size[2]/2, center[2] + size[2]/2
+    ]
+    box = pv.Box(bounds)
+    plotter.add_mesh(box, style='wireframe', color='black')
+
+    plotter.camera_position = 'iso'
+    plotter.show(auto_close=False)
+
+    for i in range(len(frames)):
+        cloud.points = frames[i]
+        plotter.add_text(f"Frame {i}", position="upper_left", name="time_label")
+        plotter.write_frame()
+
+    plotter.close()
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +165,8 @@ def run_jax(cfg: DictConfig):
     kernel_name = cfg.get('kernel', {}).get('name', 'jax')
     _maybe_enable_cuda_graphs(kernel_name)
 
+    import warp as wp
+    wp.init()
     import jax
     import jax.numpy as jnp
     from mpm_jax.solver import (
@@ -169,7 +183,6 @@ def run_jax(cfg: DictConfig):
     # because the kernel covers stress + plasticity + scatter and doesn't fit
     # the (v, C, stress, weight, ...) -> (grid_mv, grid_m) signature.
     p2g_fn = None         # None = default JAX implementation
-    fused_stages = None   # set only for cuda_fused
 
     if kernel_name == 'cuda_v1':
         from mpm_jax.cuda.p2g_cuda import make_cuda_p2g
@@ -292,32 +305,32 @@ def run_jax(cfg: DictConfig):
             "Run with timing_mode=per_stage."
         )
 
-    if kernel_name == 'cuda_v1_inline' and timing_mode == 'per_stage':
+    if kernel_name == 'cuda_v1_inline' and timing_mode != 'per_frame':
         raise RuntimeError(
             "kernel=cuda_v1_inline is only wired into the per-frame path "
             "(by design — the whole frame compiles to one XLA program). "
             "Run with timing_mode=per_frame."
         )
-    if kernel_name == 'cuda_v2_inline' and timing_mode == 'per_stage':
+    if kernel_name == 'cuda_v2_inline' and timing_mode != 'per_frame':
         raise RuntimeError(
             "kernel=cuda_v2_inline is only wired into the per-frame path "
             "(by design — the whole frame compiles to one XLA program). "
             "Run with timing_mode=per_frame."
         )
 
-    if kernel_name == 'cuda_v3_inline' and timing_mode == 'per_stage':
+    if kernel_name == 'cuda_v3_inline' and timing_mode != 'per_frame':
         raise RuntimeError(
             "kernel=cuda_v3_inline is only wired into the per-frame path. "
             "Run with timing_mode=per_frame."
         )
-    if kernel_name == 'cuda_v6_inline' and timing_mode == 'per_stage':
+    if kernel_name == 'cuda_v6_inline' and timing_mode != 'per_frame':
         raise RuntimeError(
             "kernel=cuda_v6_inline is only wired into the per-frame path "
             "(CUDA Graph capture wraps the lax.scan substep loop). "
             "Run with timing_mode=per_frame."
         )
 
-    if kernel_name == 'cuda_v4_inline' and timing_mode == 'per_stage':
+    if kernel_name == 'cuda_v4_inline' and timing_mode != 'per_frame':
         raise RuntimeError(
             "kernel=cuda_v4_inline is only wired into the per-frame path "
             "(the JAX-side sort and FFI call both live inside lax.scan). "
@@ -342,7 +355,8 @@ def run_jax(cfg: DictConfig):
                 return jit_frame(s)
 
             state = make_state()
-            state = jit_frame(state); jax.block_until_ready(state.x)
+            state = jit_frame(state)
+            jax.block_until_ready(state.x)
             _warmup_metrics(state)
         elif kernel_name == 'cuda_v2_inline':
             from mpm_jax.cuda.p2g_cuda import build_jit_frame_v2_inline
@@ -354,7 +368,8 @@ def run_jax(cfg: DictConfig):
                 return jit_frame(s)
 
             state = make_state()
-            state = jit_frame(state); jax.block_until_ready(state.x)
+            state = jit_frame(state)
+            jax.block_until_ready(state.x)
             _warmup_metrics(state)
         elif kernel_name == 'cuda_v3_inline':
             from mpm_jax.cuda.p2g_cuda import build_jit_frame_v3_inline
@@ -366,7 +381,8 @@ def run_jax(cfg: DictConfig):
                 return jit_frame(s)
 
             state = make_state()
-            state = jit_frame(state); jax.block_until_ready(state.x)
+            state = jit_frame(state)
+            jax.block_until_ready(state.x)
             _warmup_metrics(state)
         elif kernel_name == 'cuda_v6_inline':
             # Same compute path as cuda_v3_inline; the CUDA-Graph capture
@@ -380,7 +396,8 @@ def run_jax(cfg: DictConfig):
                 return jit_frame(s)
 
             state = make_state()
-            state = jit_frame(state); jax.block_until_ready(state.x)
+            state = jit_frame(state)
+            jax.block_until_ready(state.x)
             _warmup_metrics(state)
         elif kernel_name == 'cuda_v4_inline':
             from mpm_jax.cuda.p2g_cuda import build_jit_frame_v4_inline
@@ -392,7 +409,8 @@ def run_jax(cfg: DictConfig):
                 return jit_frame(s)
 
             state = make_state()
-            state = jit_frame(state); jax.block_until_ready(state.x)
+            state = jit_frame(state)
+            jax.block_until_ready(state.x)
             _warmup_metrics(state)
         else:
             jit_step = build_jit_step(params, elasticity_fn, plasticity_fn,
@@ -405,9 +423,11 @@ def run_jax(cfg: DictConfig):
 
             # Warmup: trace+compile everything we'll use in the timed region.
             state = make_state()
-            state = jit_step(state); jax.block_until_ready(state.x)
+            state = jit_step(state)
+            jax.block_until_ready(state.x)
             state = make_state()
-            state = jit_frame(state); jax.block_until_ready(state.x)
+            state = jit_frame(state)
+            jax.block_until_ready(state.x)
             _warmup_metrics(state)
     else:  # per_stage
         if kernel_name == 'cuda_fused':
@@ -458,9 +478,22 @@ def run_jax(cfg: DictConfig):
         jax.block_until_ready(state.x)
         elapsed = time.perf_counter() - t0
     else:
+        # Initialize Warp HashGrid for bookkeeping proof-of-concept
+        # HashGrid will build an acceleration structure around the JAX-computed positions
+        grid = wp.HashGrid(dim_x=sim.num_grids, dim_y=sim.num_grids, dim_z=sim.num_grids)
         t0 = time.perf_counter()
         for _ in tqdm(range(sim.num_frames), desc='JAX'):
-            frames.append(np.array(state.x))  # implicit sync via host readback
+            # Bookkeeping with Warp: copy jnp array into a wp array
+            # Zero-copy via DLPack since both are on the GPU. Fallback to CPU if warp GPU not init.
+            try:
+                # Use standard __dlpack__ protocol since JAX arrays support it natively
+                wp_x = wp.from_dlpack(state.x)
+                grid.build(wp_x, radius=float(params.dx))
+                frames.append(wp_x.numpy())
+            except Exception:
+                # Fallback if no GPU for warp (e.g. CI environments)
+                frames.append(np.array(state.x))
+
             t_frame = time.perf_counter()
             state = run_frame(state)
             jax.block_until_ready(state.x)
@@ -472,6 +505,8 @@ def run_jax(cfg: DictConfig):
                 'timestep_ms': frame_ms,
             })
         elapsed = time.perf_counter() - t0
+
+
 
     cuda_profiler_stop()
     total_steps = sim.num_frames * sim.steps_per_frame

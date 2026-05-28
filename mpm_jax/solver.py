@@ -315,7 +315,8 @@ def build_jit_frame(params, elasticity_fn, plasticity_fn,
                          0.0, p2g_fn=_p2g_fn)
             state = state._replace(F=plasticity_fn(state.F))
             return state, None
-        state, _ = jax.lax.scan(scan_body, state, None, length=steps_per_frame)
+        for _ in range(steps_per_frame):
+            state, _ = scan_body(state, None)
         return state
 
     return jit_frame

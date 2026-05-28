@@ -9,7 +9,6 @@ import os
 os.environ['WANDB_MODE'] = 'disabled'
 
 import time
-import sys
 import numpy as np
 import jax
 import jax.numpy as jnp

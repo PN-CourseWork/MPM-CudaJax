@@ -14,6 +14,8 @@ dependencies = [
     "tqdm",
     "numpy",
     "wandb",
+    "warp-lang",
+    "pyvista",
 ]
 
 [tool.scikit-build]
@@ -47,6 +49,12 @@ scikit-build-core = ">=0.10"
 ninja = "*"
 seaborn = ">=0.13.2,<0.14"
 pandas = ">=3.0.3,<4"
+pyvista = "*"
+imageio = "*"
+# NOTE: `warp-lang` is intentionally NOT here. The conda-forge build pulls
+# `jax` as a hard runtime dep, which would conflict with the hpc env's
+# pypi-side `jax[cuda12-local]` (pixi can't apply pypi extras to a
+# conda-installed jax). warp-lang is added per-feature below.
 
 [tool.pixi.pypi-dependencies]
 mpm-cudajax = { path = ".", editable = true }
@@ -54,6 +62,7 @@ mpm-cudajax = { path = ".", editable = true }
 [tool.pixi.feature.cpu.dependencies]
 jax = ">=0.4.20"
 jaxlib = ">=0.4.20"
+warp-lang = "*"
 
 [tool.pixi.feature.dev.dependencies]
 pytest = "*"
@@ -68,6 +77,7 @@ jaxlib = { version = ">=0.4.20", build = "*cuda12*" }
 cuda-version = "12.*"
 cuda-nvcc = "*"
 gxx = "*"
+warp-lang = "*"
 
 [tool.pixi.feature.gpu.system-requirements]
 cuda = "12.0"
@@ -79,9 +89,40 @@ cuda = "12.0"
 #     sudo apt-get install nsight-systems nsight-compute
 # Both end up on PATH and `simulate.py` picks them up from there.
 
+# HPC / module-system environment. Unlike `gpu` (which bundles a full
+# conda-forge CUDA 12 stack), `hpc` brings NO CUDA libs of its own and
+# instead relies on a site-provided CUDA toolkit loaded via `module load`
+# (e.g. `module load nvhpc/24.1` on DTU). jax is installed from PyPI with
+# the `cuda12-local` extras, which link against whatever libcuda /
+# libcudart are on LD_LIBRARY_PATH at runtime. This avoids the common HPC
+# failure mode where conda-forge ships CUDA 12.9 but the node's driver
+# only supports 12.3, producing CUDA_ERROR_INVALID_IMAGE on the first jit.
+#
+# Workflow on the HPC node:
+#     module load nvhpc/24.1            # provides nvcc + libcuda matched to driver
+#     pixi install -e hpc               # builds .cu kernels with module's nvcc
+#     pixi run -e hpc python simulate.py ...
+# Same module's `ncu` is on PATH, so `profile=ncu` also works.
+[tool.pixi.feature.hpc]
+platforms = ["linux-64", "linux-aarch64"]
+
+[tool.pixi.feature.hpc.dependencies]
+gxx = "*"
+
+[tool.pixi.feature.hpc.pypi-dependencies]
+jax = { version = ">=0.4.20", extras = ["cuda12-local"] }
+warp-lang = "*"
+# cuDNN is not in NVHPC 24.1's tree on DTU's gracy, and jax[cuda12-local]
+# checks for it at initialize() time. Pull the wheel from PyPI; it
+# unpacks libcudnn.so.* into site-packages/nvidia/cudnn/lib/ and adds
+# itself to the dlopen path automatically. Removes one site-specific
+# LD_LIBRARY_PATH dance.
+nvidia-cudnn-cu12 = "*"
+
 [tool.pixi.environments]
 default = { features = ["cpu", "dev"], solve-group = "cpu" }
 gpu = { features = ["gpu", "dev"], solve-group = "gpu" }
+hpc = { features = ["hpc", "dev"], solve-group = "hpc" }
 
 [tool.pixi.tasks]
 test = "pytest tests/ -v"
@@ -98,6 +139,13 @@ sync = { args = [{ arg = "host" }], cmd = "rsync -ahz --info=stats1,name0 --excl
 sync-results = { args = [{ arg = "host" }], cmd = "rsync -ahz --info=stats1,name0 --include='outputs/' --include='outputs/**' --include='multirun/' --include='multirun/**' --include='output/' --include='output/**' --exclude='*' {{ host }}:~/MPM-CudaJax/ ./" }
 
 [tool.pixi.feature.gpu.tasks]
+sim = "python simulate.py"
+sweep = "python simulate.py -cn sweep_baseline"
+sweep-quick = "python simulate.py -cn sweep_quick"
+sweep-all = "python simulate.py -cn sweep_all"
+rebuild-cuda = "pixi reinstall mpm-cudajax"
+
+[tool.pixi.feature.hpc.tasks]
 sim = "python simulate.py"
 sweep = "python simulate.py -cn sweep_baseline"
 sweep-quick = "python simulate.py -cn sweep_quick"
