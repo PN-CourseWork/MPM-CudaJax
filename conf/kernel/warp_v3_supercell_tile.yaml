@@ -1,0 +1,4 @@
+# warp_v3_supercell_tile — super-cell-owned Warp tile P2G. Particles are
+# sorted by home super-cell; each Warp block accumulates one 4^3 grid-node
+# shared tile with tile_scatter_add and flushes it to global memory once.
+name: warp_v3_supercell_tile

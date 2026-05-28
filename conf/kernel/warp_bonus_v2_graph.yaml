@@ -1,0 +1,4 @@
+# warp_bonus_v2_graph — pure Warp graph-captured indexed super-cell tile.
+# Sorts particle ids only, then gathers from old state and writes next state
+# in sorted order to avoid copying x/v/C/F during binning.
+name: warp_bonus_v2_graph

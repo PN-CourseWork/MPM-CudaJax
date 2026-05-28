@@ -9,10 +9,10 @@ from omegaconf import DictConfig
 
 def get_particles(n_particles, center, size):
     """Sample n_particles uniformly in a box."""
-    start = np.array(center) - np.array(size) / 2
-    end = np.array(center) + np.array(size) / 2
+    start = np.array(center, dtype=np.float32) - np.array(size, dtype=np.float32) / 2
+    end = np.array(center, dtype=np.float32) + np.array(size, dtype=np.float32) / 2
     rng = np.random.RandomState(42)
-    return start + rng.rand(n_particles, 3) * (end - start)
+    return (start + rng.rand(n_particles, 3).astype(np.float32) * (end - start)).astype(np.float32, copy=False)
 
 
 def visualize_frames(frames, export_path, center=[0.5, 0.5, 0.5],
@@ -55,6 +55,77 @@ def visualize_frames(frames, export_path, center=[0.5, 0.5, 0.5],
 # ---------------------------------------------------------------------------
 # Backend-specific runners
 # ---------------------------------------------------------------------------
+
+def run_warp_bonus(cfg: DictConfig):
+    """Run the pure-Warp graph-captured tiled prototype."""
+    import warp as wp
+    from mpm_jax.warp_bonus import WarpBonusSimulator
+
+    sim = cfg.sim
+    kernel_name = cfg.get('kernel', {}).get('name', 'warp_bonus_graph')
+    indexed_sort = kernel_name == 'warp_bonus_v2_graph'
+
+    elasticity = cfg.get('material', {}).get('elasticity', {}).get('name', None)
+    plasticity = cfg.get('material', {}).get('plasticity', {}).get('name', None)
+    if elasticity != 'CorotatedElasticityJacobi' or plasticity != 'IdentityPlasticity':
+        raise RuntimeError(
+            f"kernel={kernel_name} currently supports material=jelly_jacobi "
+            "only: CorotatedElasticityJacobi + IdentityPlasticity."
+        )
+
+    if int(sim.num_grids) % 2 != 0:
+        raise RuntimeError(f"kernel={kernel_name} requires sim.num_grids divisible by 2.")
+
+    n = int(sim.n_particles)
+    cube_np = get_particles(n, center=list(sim.center), size=[0.5, 0.5, 0.5])
+    precompute_stress = not (indexed_sort and n >= 150_000_000)
+    if indexed_sort:
+        print("Using pure NVIDIA Warp graph-captured indexed super-cell tile MPM step (warp_bonus_v2_graph)")
+        if not precompute_stress:
+            print("warp_bonus_v2_graph: disabling stress precompute to fit large particle count in GPU memory")
+    else:
+        print("Using pure NVIDIA Warp graph-captured super-cell tile MPM step (warp_bonus_graph)")
+    print(f"N={n}, G={sim.num_grids}")
+
+    runner = WarpBonusSimulator(cube_np, cfg, indexed_sort=indexed_sort, precompute_stress=precompute_stress)
+    runner.warmup()
+
+    frames = []
+    frame_metrics = []
+    total_steps = int(sim.num_frames) * int(sim.steps_per_frame)
+
+    if cfg.get('benchmark', False):
+        result = runner.run_frames(int(sim.num_frames))
+        elapsed = result.elapsed_s
+    else:
+        t0 = time.perf_counter()
+        for frame in tqdm(range(sim.num_frames), desc='Warp'):
+            t_frame = time.perf_counter()
+            runner.launch_frame()
+            wp.synchronize_device(runner.device)
+            frame_ms = (time.perf_counter() - t_frame) * 1000
+            x_np = runner.x.numpy()
+            v_np = runner.v.numpy()
+            frames.append(x_np)
+            frame_metrics.append({
+                'x_mean_z': float(x_np[:, 2].mean()),
+                'v_max': float(np.abs(v_np).max()),
+                'frame_ms': frame_ms,
+                'timestep_ms': frame_ms,
+            })
+        elapsed = time.perf_counter() - t0
+
+    avg_frame_ms = elapsed / sim.num_frames * 1000
+    summary = {
+        'timestep': {
+            'mean_ms': avg_frame_ms,
+            'std_ms': 0.0,
+            'total_ms': elapsed * 1000,
+            'count': sim.num_frames,
+        }
+    }
+    return frames, elapsed, total_steps, summary, frame_metrics
+
 
 def _maybe_enable_cuda_graphs(kernel_name):
     """Toggle XLA command-buffer capture (= CUDA Graphs) for the v6 kernel.
@@ -122,6 +193,8 @@ def run_jax(cfg: DictConfig):
         # atomicAdd inside the 27-stencil loop. Tests whether warp coalescing
         # helps once the (N, 27, *) materialisation overhead is gone.
         print("Using CUDA inline P2G kernel with warp shuffle (cuda_v2_inline)")
+    elif kernel_name == 'cuda_v2_fori_inline':
+        print("Using CUDA inline P2G kernel with warp shuffle + JAX lax.fori_loop (cuda_v2_fori_inline)")
     elif kernel_name == 'cuda_v3_inline':
         # cuda_v3_inline: cuda_v1_inline + Morton (Z-order) spatial sort of
         # particles before each substep + warp-shuffle atomic coalescing.
@@ -129,6 +202,8 @@ def run_jax(cfg: DictConfig):
         # stencil-node targets, so `__match_any_sync` collapses 4-8x of the
         # atomics into one. Tradeoff: an argsort per substep (O(N log N)).
         print("Using CUDA inline P2G kernel with Morton sort + warp shuffle (cuda_v3_inline)")
+    elif kernel_name == 'cuda_v3_fori_inline':
+        print("Using CUDA inline P2G kernel with Morton sort + warp shuffle + JAX lax.fori_loop (cuda_v3_fori_inline)")
     elif kernel_name == 'cuda_v6_inline':
         # cuda_v6_inline: exactly the cuda_v3_inline pipeline (Morton sort +
         # warp-shuffle inline scatter + fused G2P), but with XLA's command
@@ -148,6 +223,16 @@ def run_jax(cfg: DictConfig):
         # 27-stencil atomic scatter, called inside JAX JIT through Warp's
         # experimental JAX FFI.
         print("Using NVIDIA Warp inline P2G kernel via JAX FFI (warp_v1_inline)")
+    elif kernel_name == 'warp_v2_tile':
+        # warp_v2_tile: launches a Warp tiled kernel from inside JAX JIT via
+        # jax_callable. Each block tile-loads 64 particles into shared storage
+        # before the per-lane 27-stencil atomic scatter.
+        print("Using NVIDIA Warp tiled P2G kernel via JAX FFI (warp_v2_tile)")
+    elif kernel_name == 'warp_v3_supercell_tile':
+        # warp_v3_supercell_tile: cell-owned Warp tile path. Particles are
+        # sorted by home super-cell; one Warp block accumulates a 4^3 shared
+        # grid-node tile and flushes it once to global memory.
+        print("Using NVIDIA Warp super-cell tile P2G kernel via JAX FFI (warp_v3_supercell_tile)")
     elif kernel_name == 'jax_v1_5':
         print("Using JAX P2G with lax.scan over 27 stencil offsets (jax_v1_5)")
     else:
@@ -197,16 +282,18 @@ def run_jax(cfg: DictConfig):
             jit_frame = build_jit_frame_inline(
                 params, elasticity_fn, plasticity_fn,
                 pre_fn, post_fn, sim.steps_per_frame)
-        elif kernel_name == 'cuda_v2_inline':
+        elif kernel_name in ('cuda_v2_inline', 'cuda_v2_fori_inline'):
             from mpm_jax.cuda.p2g_cuda import build_jit_frame_v2_inline
             jit_frame = build_jit_frame_v2_inline(
                 params, elasticity_fn, plasticity_fn,
-                pre_fn, post_fn, sim.steps_per_frame)
-        elif kernel_name in ('cuda_v3_inline', 'cuda_v6_inline'):
+                pre_fn, post_fn, sim.steps_per_frame,
+                loop_kind='fori' if kernel_name == 'cuda_v2_fori_inline' else 'python')
+        elif kernel_name in ('cuda_v3_inline', 'cuda_v3_fori_inline', 'cuda_v6_inline'):
             from mpm_jax.cuda.p2g_cuda import build_jit_frame_v3_inline
             jit_frame = build_jit_frame_v3_inline(
                 params, elasticity_fn, plasticity_fn,
-                pre_fn, post_fn, sim.steps_per_frame)
+                pre_fn, post_fn, sim.steps_per_frame,
+                loop_kind='fori' if kernel_name == 'cuda_v3_fori_inline' else 'python')
         elif kernel_name == 'cuda_v4_inline':
             from mpm_jax.cuda.p2g_cuda import build_jit_frame_v4_inline
             jit_frame = build_jit_frame_v4_inline(
@@ -215,6 +302,16 @@ def run_jax(cfg: DictConfig):
         elif kernel_name == 'warp_v1_inline':
             from mpm_jax.warp_p2g import build_jit_frame_warp_inline
             jit_frame = build_jit_frame_warp_inline(
+                params, elasticity_fn, plasticity_fn,
+                pre_fn, post_fn, sim.steps_per_frame)
+        elif kernel_name == 'warp_v2_tile':
+            from mpm_jax.warp_p2g import build_jit_frame_warp_tile
+            jit_frame = build_jit_frame_warp_tile(
+                params, elasticity_fn, plasticity_fn,
+                pre_fn, post_fn, sim.steps_per_frame)
+        elif kernel_name == 'warp_v3_supercell_tile':
+            from mpm_jax.warp_p2g import build_jit_frame_warp_supercell_tile
+            jit_frame = build_jit_frame_warp_supercell_tile(
                 params, elasticity_fn, plasticity_fn,
                 pre_fn, post_fn, sim.steps_per_frame)
         elif kernel_name == 'jax_v1_5':
@@ -234,9 +331,10 @@ def run_jax(cfg: DictConfig):
     with jax.profiler.TraceAnnotation("warmup", kernel=kernel_name):
         state = make_state()
         if kernel_name not in (
-            'cuda_v1_inline', 'cuda_v2_inline', 'cuda_v3_inline',
+            'cuda_v1_inline', 'cuda_v2_inline', 'cuda_v2_fori_inline',
+            'cuda_v3_inline', 'cuda_v3_fori_inline',
             'cuda_v4_inline', 'cuda_v6_inline', 'jax_v1_5',
-            'warp_v1_inline',
+            'warp_v1_inline', 'warp_v2_tile', 'warp_v3_supercell_tile',
         ):
             state = jit_step(state)
             jax.block_until_ready(state.x)
@@ -326,10 +424,14 @@ def main(cfg: DictConfig):
         )
 
     kernel_name = cfg.get('kernel', {}).get('name', 'jax')
+    is_warp_bonus = kernel_name in {'warp_bonus_graph', 'warp_bonus_v2_graph'}
 
     # CUDA Graphs toggle (v6) must happen before any `import jax` in this
     # process — including the profile=jax branch a few lines down.
     _maybe_enable_cuda_graphs(kernel_name)
+
+    if is_warp_bonus and profile_name == 'jax':
+        raise RuntimeError(f"kernel={kernel_name} is pure Warp and does not emit a JAX trace.")
 
     # JAX profiler (in-process, writes TensorBoard trace)
     jax_trace_dir = None
@@ -343,7 +445,10 @@ def main(cfg: DictConfig):
         print(f"JAX profiler started -> {jax_trace_dir}")
 
     # Run simulation.
-    frames, elapsed, total_steps, summary, _frame_metrics = run_jax(cfg)
+    if is_warp_bonus:
+        frames, elapsed, total_steps, summary, _frame_metrics = run_warp_bonus(cfg)
+    else:
+        frames, elapsed, total_steps, summary, _frame_metrics = run_jax(cfg)
 
     # Stop JAX profiler
     if profile_name == 'jax':
@@ -354,7 +459,8 @@ def main(cfg: DictConfig):
     # Print timing summary
     steps_per_sec = total_steps / elapsed
     ms_per_step = elapsed / total_steps * 1000
-    print(f"\njax ({kernel_name}): {total_steps} steps in {elapsed:.2f}s ({steps_per_sec:.1f} steps/s, {ms_per_step:.2f} ms/step)")
+    backend_label = "warp" if is_warp_bonus else "jax"
+    print(f"\n{backend_label} ({kernel_name}): {total_steps} steps in {elapsed:.2f}s ({steps_per_sec:.1f} steps/s, {ms_per_step:.2f} ms/step)")
 
     total_ms = sum(s['total_ms'] for s in summary.values())
     print(f"\nWall-clock timing (per frame, {cfg.sim.steps_per_frame} substeps each):")

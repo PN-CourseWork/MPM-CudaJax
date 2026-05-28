@@ -1,0 +1,3 @@
+# warp_bonus_graph — pure NVIDIA Warp graph-captured super-cell tile MPM step.
+# Keeps the full timestep in Warp and replays the per-frame CUDA graph.
+name: warp_bonus_graph

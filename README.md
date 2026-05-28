@@ -109,6 +109,10 @@ pixi run -e gpu python simulate.py benchmark=true
 pixi run -e gpu python simulate.py kernel=jax        # XLA baseline
 pixi run -e gpu python simulate.py kernel=jax_v1_5   # scan over stencil offsets
 pixi run -e gpu python simulate.py kernel=warp_v1_inline material=jelly_jacobi
+pixi run -e gpu python simulate.py kernel=warp_v2_tile material=jelly_jacobi sim.n_particles=1000000
+pixi run -e gpu python simulate.py kernel=warp_v3_supercell_tile material=jelly_jacobi
+pixi run -e gpu python simulate.py kernel=warp_bonus_graph material=jelly_jacobi benchmark=true
+pixi run -e gpu python simulate.py kernel=warp_bonus_v2_graph material=jelly_jacobi benchmark=true
 pixi run -e gpu python simulate.py kernel=cuda_v2_inline material=jelly_jacobi
 pixi run -e gpu python simulate.py kernel=cuda_v3_inline material=jelly_jacobi
 
@@ -132,6 +136,10 @@ because they kept the JAX-side `(N, 27, *)` materialisation bottleneck.
 | `jax` | Pure JAX/XLA. cuSOLVER SVD, vmap'd compute, `jnp.at[].add()` scatter. |
 | `jax_v1_5` | Pure JAX/XLA, but P2G scans over the 27 stencil offsets to avoid a large P2G intermediate. |
 | `warp_v1_inline` | Inline P2G authored as an NVIDIA Warp kernel and called from inside JAX JIT through `warp.jax_experimental.jax_kernel`. |
+| `warp_v2_tile` | Experimental Warp tile P2G called through `warp.jax_experimental.jax_callable`; tile-loads 64-particle blocks before Warp-native atomic scatter. |
+| `warp_v3_supercell_tile` | Super-cell-owned Warp tile P2G: sort by home super-cell, accumulate a 4^3 shared tile with `tile_scatter_add`, then flush to global grid. |
+| `warp_bonus_graph` | Pure Warp prototype: bins particles by super-cell, runs tiled P2G + grid update + G2P in Warp, and replays captured CUDA graphs without JAX. Currently supports `material=jelly_jacobi`. |
+| `warp_bonus_v2_graph` | Pure Warp graph path that sorts particle ids only, then gathers state in tiled P2G/G2P to avoid copying sorted `x/v/C/F` buffers. Currently supports `material=jelly_jacobi`. |
 | `cuda_v*_inline` | Inline-weight CUDA P2G variants that avoid the `(N, 27, *)` P2G materialisation; paired with fused CUDA G2P in the fully JITted frame path. |
 | `cuda_fused` | Deprecated CLI path; retained in lower-level code/tests as the historical fully fused CUDA experiment. |
 

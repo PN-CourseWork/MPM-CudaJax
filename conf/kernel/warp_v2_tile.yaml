@@ -1,0 +1,4 @@
+# warp_v2_tile — experimental Warp tile P2G. Uses wp.launch_tiled through
+# warp.jax_experimental.jax_callable and tile-loads 64-particle blocks before
+# doing Warp-native atomic scatter.
+name: warp_v2_tile

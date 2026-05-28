@@ -456,7 +456,7 @@ def _home_super_cell_id(x, inv_dx, G, sc=V4_SUPER_CELL_WIDTH):
 
 def build_jit_frame_v2_inline(params, elasticity_fn, plasticity_fn,
                               pre_particle_fn, post_grid_fn, steps_per_frame,
-                              use_cuda_g2p=True):
+                              use_cuda_g2p=True, loop_kind="python"):
     """Per-frame JIT'd function using the cuda_v2_inline P2G kernel.
 
     Identical structure to ``build_jit_frame_inline``; only the P2G FFI call
@@ -483,7 +483,7 @@ def build_jit_frame_v2_inline(params, elasticity_fn, plasticity_fn,
 
     @jax.jit
     def jit_frame(state):
-        def scan_body(state, _):
+        def step_body(state):
             with jax.named_scope("pre_particle"):
                 x, v = pre_particle_fn(state.x, state.v, 0.0)
             with jax.named_scope("elasticity"):
@@ -515,10 +515,16 @@ def build_jit_frame_v2_inline(params, elasticity_fn, plasticity_fn,
 
             with jax.named_scope("plasticity"):
                 new_F = plasticity_fn(new_F)
-            return MPMState(x=new_x, v=new_v, C=new_C, F=new_F), None
+            return MPMState(x=new_x, v=new_v, C=new_C, F=new_F)
 
-        for _ in range(steps_per_frame):
-            state, _ = scan_body(state, None)
+        def fori_body(_, state):
+            return step_body(state)
+
+        if loop_kind == "fori":
+            state = jax.lax.fori_loop(0, steps_per_frame, fori_body, state)
+        else:
+            for _ in range(steps_per_frame):
+                state = step_body(state)
         return state
 
     return jit_frame
@@ -526,7 +532,7 @@ def build_jit_frame_v2_inline(params, elasticity_fn, plasticity_fn,
 
 def build_jit_frame_v3_inline(params, elasticity_fn, plasticity_fn,
                               pre_particle_fn, post_grid_fn, steps_per_frame,
-                              use_cuda_g2p=True):
+                              use_cuda_g2p=True, loop_kind="python"):
     """Per-frame JIT'd function using cuda_v3_inline (Morton sort + warp shuffle).
 
     Each substep sorts particles by Morton (Z-order) code, then runs the
@@ -554,7 +560,7 @@ def build_jit_frame_v3_inline(params, elasticity_fn, plasticity_fn,
 
     @jax.jit
     def jit_frame(state):
-        def scan_body(state, _):
+        def step_body(state):
             with jax.named_scope("morton_sort"):
                 order = morton_argsort(state.x, params.inv_dx, params.num_grids)
                 x_sorted = state.x[order]
@@ -593,10 +599,16 @@ def build_jit_frame_v3_inline(params, elasticity_fn, plasticity_fn,
 
             with jax.named_scope("plasticity"):
                 new_F = plasticity_fn(new_F)
-            return MPMState(x=new_x, v=new_v, C=new_C, F=new_F), None
+            return MPMState(x=new_x, v=new_v, C=new_C, F=new_F)
 
-        for _ in range(steps_per_frame):
-            state, _ = scan_body(state, None)
+        def fori_body(_, state):
+            return step_body(state)
+
+        if loop_kind == "fori":
+            state = jax.lax.fori_loop(0, steps_per_frame, fori_body, state)
+        else:
+            for _ in range(steps_per_frame):
+                state = step_body(state)
         return state
 
     return jit_frame

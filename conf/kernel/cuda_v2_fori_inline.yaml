@@ -1,0 +1,2 @@
+# cuda_v2_fori_inline — cuda_v2_inline frame loop lowered through lax.fori_loop.
+name: cuda_v2_fori_inline
