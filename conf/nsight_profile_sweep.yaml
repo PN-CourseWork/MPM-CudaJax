@@ -1,4 +1,4 @@
-# Example native Nsight Python parameter sweep.
+# Example native Nsight Python P2G-stage parameter sweep.
 #
 # Run:
 #   pixi run -e gpu python profile_nsight.py -cn nsight_profile_sweep
@@ -7,52 +7,54 @@ defaults:
   - _self_
 
 kernel:
-  name: warp_bonus_v2_graph
+  name: jax
+
+material:
+  elasticity:
+    name: CorotatedElasticityJacobi
+    E: 2e6
+    nu: 0.4
+  plasticity:
+    name: IdentityPlasticity
+  color: blue
 
 nsight:
-  phase: step
+  phase: p2g
+  include_step_total: false
   analyze:
-    runs: 3
+    runs: 1
+    replay_mode: kernel
+    combine_kernel_metrics: sum
+    derive_metric: throughput
     metrics:
       - gpu__time_duration.sum
   plot:
     enabled: true
-    metric: gpu__time_duration.sum
+    metric: p2g_mparticles_per_s
+    ylabel: P2G throughput (M particles/s)
     x_keys:
       - n_particles
-    variant_fields:
-      - kernel_name
-    variant_annotations:
-      - p2g
-      - g2p
-    filename: nsight_sweep.png
-    title: Warp Bonus Sweep
-  configs:
-    - label: v1_1m
-      kernel:
-        name: warp_bonus_graph
-      sim:
-        n_particles: 1000000
-        num_grids: 32
-        steps_per_frame: 1
-    - label: v2_1m
-      kernel:
-        name: warp_bonus_v2_graph
-      sim:
-        n_particles: 1000000
-        num_grids: 32
-        steps_per_frame: 1
-    - label: v1_10m
-      kernel:
-        name: warp_bonus_graph
-      sim:
-        n_particles: 10000000
-        num_grids: 32
-        steps_per_frame: 1
-    - label: v2_10m
-      kernel:
-        name: warp_bonus_v2_graph
-      sim:
-        n_particles: 10000000
-        num_grids: 32
-        steps_per_frame: 1
+    variant_fields: null
+    variant_annotations: null
+    filename: nsight_p2g_sweep.png
+    title: P2G Stage Throughput Sweep
+  sweep:
+    kernels:
+      - jax
+      - jax_v1_5
+      - cuda_v1_inline
+      - cuda_v2_inline
+      - cuda_v3_inline
+      - cuda_v4_inline
+      - warp_v1_inline
+      - warp_v2_tile
+      - warp_v3_supercell_tile
+      - warp_bonus_graph
+      - warp_bonus_v2_graph
+    n_particles:
+      - 65536
+      - 262144
+    num_grids:
+      - 32
+    steps_per_frame:
+      - 1

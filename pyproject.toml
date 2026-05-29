@@ -80,6 +80,7 @@ jax = ">=0.4.20"
 jaxlib = { version = ">=0.4.20", build = "*cuda12*" }
 cuda-version = "12.*"
 cuda-nvcc = "*"
+nsight-compute = ">=2025.2,<2025.3"
 gxx = "*"
 warp-lang = "*"
 

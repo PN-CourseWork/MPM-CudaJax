@@ -1,8 +1,8 @@
-# Hydra-driven Nsight Python profiler for kernel phases or full Warp timesteps.
+# Hydra-driven Nsight Python profiler for P2G stages or full Warp timesteps.
 #
 # Example:
 #   pixi run -e gpu python profile_nsight.py -cn nsight_profile \
-#     kernel=warp_bonus_v2_graph nsight.phase=step sim.n_particles=1000000
+#     kernel=jax material=jelly_jacobi nsight.phase=p2g sim.n_particles=65536
 defaults:
   - config
   - _self_
@@ -11,9 +11,9 @@ benchmark: true
 tag: nsight_profile
 
 nsight:
-  # p2g profiles only the dominant P2G phase. step profiles one full Warp
-  # timestep and emits one Nsight annotation per phase plus an enclosing step.
-  phase: step
+  # p2g profiles one annotated P2G stage wrapper per kernel. step is retained
+  # for the pure-Warp bonus kernels and emits one annotation per timestep phase.
+  phase: p2g
   include_step_total: true
   write_json: true
   plot:
@@ -21,6 +21,7 @@ nsight:
     metric: gpu__time_duration.sum
     filename: nsight_plot.png
     title: Nsight Kernel Metrics
+    ylabel: GPU time duration (ns)
     row_panels: null
     col_panels: null
     x_keys: null
@@ -30,36 +31,37 @@ nsight:
     show_aggregate: avg
     annotate_points: false
     print_data: false
-  # Native Nsight Python parameter sweep. Each entry is merged into the Hydra
-  # config before constructing the profiled Warp simulator. Common dimensions
-  # are unpacked into Nsight result columns: label, kernel_name, n_particles,
-  # num_grids, and steps_per_frame.
-  configs:
-    - label: default
-      kernel:
-        name: ${kernel.name}
-      sim:
-        n_particles: ${sim.n_particles}
-        num_grids: ${sim.num_grids}
-        steps_per_frame: ${sim.steps_per_frame}
+  # Native Nsight Python parameter sweep. n_particles, num_grids, and
+  # steps_per_frame are combined with itertools.product and become function
+  # parameters/DataFrame columns. kernels are run inside each config as
+  # annotation variants, matching the official framework-comparison examples.
+  sweep:
+    kernels:
+      - ${kernel.name}
+    n_particles:
+      - ${sim.n_particles}
+    num_grids:
+      - ${sim.num_grids}
+    steps_per_frame:
+      - ${sim.steps_per_frame}
   # Passed directly to nsight.analyze.kernel after Hydra resolves the config.
   # Any Nsight Python analyzer option with a YAML-serializable value can be
-  # overridden here, e.g. nsight.analyze.replay_mode=range.
+  # overridden here. combine_kernel_metrics accepts null, sum, max, or min.
+  # derive_metric accepts null, throughput, or speed_of_light.
   analyze:
     runs: 1
     output: progress
     output_csv: true
     replay_mode: kernel
+    combine_kernel_metrics: sum
     cache_control: all
     clock_control: none
+    derive_metric: throughput
     metrics:
       - gpu__time_duration.sum
-      - sm__throughput.avg.pct_of_peak_sustained_elapsed
-      - gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed
-      - dram__throughput.avg.pct_of_peak_sustained_elapsed
 
 sim:
-  n_particles: 1000000
+  n_particles: 65536
   num_grids: 32
   num_frames: 1
   steps_per_frame: 1
